@@ -1,0 +1,238 @@
+use valk.math
+
+/// How `resize` samples the source.
+///
+/// `nearest` copies pixels, `box` averages them (good for downscaling), `bilinear` blends
+/// the closest ones, `bicubic` (Catmull-Rom) and `lanczos` keep detail sharpest.
++ enum Filter {
+    nearest
+    box
+    bilinear
+    bicubic
+    lanczos
+}
+
+value PI (3.141592653589793)
+
+extend Image {
+    /// Returns the image scaled to `width` by `height` with `filter`.
+    ///
+    /// Scaling works in two passes, rows then columns, so a large image costs about
+    /// `width * height` weighted sums per pass. Throws `range` for an empty size.
+    + fn resize(width: uint, height: uint, filter: Filter (Filter.lanczos)) SELF !ImageError {
+        if width == 0 || height == 0 : throw .range { message: "Empty resize" }
+        if width == this.width && height == this.height : return this.clone()
+        if filter == Filter.nearest : return this.resize_nearest(width, height) !>
+        let pass = this.resample_rows(width, filter) !>
+        return pass.resample_columns(height, filter) !>
+    }
+
+    /// Returns the largest image that fits inside `width` by `height` with the same
+    /// proportions; an image that already fits is returned unchanged.
+    + fn fit(width: uint, height: uint, filter: Filter (Filter.lanczos)) SELF !ImageError {
+        if this.width <= width && this.height <= height : return this.clone()
+        let by_width = height * this.width >= width * this.height
+        let w = by_width ? width : (height * this.width + this.height / 2) / this.height
+        let h = by_width ? (width * this.height + this.width / 2) / this.width : height
+        return this.resize(w == 0 ? 1 : w, h == 0 ? 1 : h, filter) !>
+    }
+
+    /// Returns exactly `width` by `height`: the image is scaled to cover that size and the
+    /// overflow is cropped away evenly on both sides.
+    + fn cover(width: uint, height: uint, filter: Filter (Filter.lanczos)) SELF !ImageError {
+        if width == 0 || height == 0 : throw .range { message: "Empty size" }
+        let by_width = height * this.width <= width * this.height
+        let w = by_width ? width : (height * this.width + this.height / 2) / this.height
+        let h = by_width ? (width * this.height + this.width / 2) / this.width : height
+        if w < width : w = width
+        if h < height : h = height
+        let scaled = this.resize(w, h, filter) !>
+        return scaled.crop((w - width) / 2, (h - height) / 2, width, height) !>
+    }
+
+    - fn resize_nearest(width: uint, height: uint) SELF !ImageError {
+        let out = SELF.new(width, height, this.channels) !>
+        let c = this.channels.to(uint)
+        let y: uint = 0
+        while y < height {
+            let sy = y * this.height / height
+            let x: uint = 0
+            while x < width {
+                let sx = x * this.width / width
+                let from = this.offset(sx, sy)
+                let to = out.offset(x, y)
+                let k: uint = 0
+                while k < c {
+                    out.pixels[to + k] = this.pixels[from + k]
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+        return out
+    }
+
+    - fn resample_rows(width: uint, filter: Filter) SELF !ImageError {
+        if width == this.width : return this
+        let out = SELF.new(width, this.height, this.channels) !>
+        let weights = Weights.compute(this.width, width, filter)
+        let c = this.channels.to(uint)
+        let sums: [float x 4] = { 0.0... }
+        let y: uint = 0
+        while y < this.height {
+            let src = this.row(y)
+            let dst = out.row(y)
+            let x: uint = 0
+            while x < width {
+                let start = weights.start[x]
+                let count = weights.count[x]
+                let first = x * weights.taps
+                let k: uint = 0
+                while k < c : sums[k++] = 0.0
+                let i: uint = 0
+                while i < count {
+                    let w = weights.values[first + i]
+                    let at = (start + i) * c
+                    k = 0
+                    while k < c {
+                        sums[k] += src[at + k].to(float) * w
+                        k++
+                    }
+                    i++
+                }
+                k = 0
+                while k < c {
+                    dst[x * c + k] = clamp_byte(sums[k])
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+        return out
+    }
+
+    - fn resample_columns(height: uint, filter: Filter) SELF !ImageError {
+        if height == this.height : return this
+        let out = SELF.new(this.width, height, this.channels) !>
+        let weights = Weights.compute(this.height, height, filter)
+        let c = this.channels.to(uint)
+        let stride = this.stride
+        let sums: [float x 4] = { 0.0... }
+        let y: uint = 0
+        while y < height {
+            let start = weights.start[y]
+            let count = weights.count[y]
+            let first = y * weights.taps
+            let dst = out.row(y)
+            let x: uint = 0
+            while x < this.width {
+                let k: uint = 0
+                while k < c : sums[k++] = 0.0
+                let i: uint = 0
+                while i < count {
+                    let w = weights.values[first + i]
+                    let at = (start + i) * stride + x * c
+                    k = 0
+                    while k < c {
+                        sums[k] += this.pixels[at + k].to(float) * w
+                        k++
+                    }
+                    i++
+                }
+                k = 0
+                while k < c {
+                    dst[x * c + k] = clamp_byte(sums[k])
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+        return out
+    }
+}
+
+fn clamp_byte(value: float) u8 {
+    if value <= 0.0 : return 0
+    if value >= 255.0 : return 255
+    return (value + 0.5).to(u8)
+}
+
+// The source pixels and weights each output pixel of one axis is made of
+class Weights {
+    start: Array[uint]
+    count: Array[uint]
+    values: Array[float]
+    taps: uint
+
+    static fn compute(from: uint, to: uint, filter: Filter) SELF {
+        let scale = from.to(float) / to.to(float)
+        // When shrinking, the kernel widens so every source pixel contributes
+        let stretch = scale > 1.0 ? scale : 1.0
+        let radius = filter_radius(filter) * stretch
+        let taps = (radius * 2.0).to(uint) + 2
+        let start = Array[uint].new(to)
+        let count = Array[uint].new(to)
+        let values = Array[float]{ 0.0 x (to * taps) }
+        let x: uint = 0
+        while x < to {
+            let center = (x.to(float) + 0.5) * scale - 0.5
+            let lo = math.floor(center - radius + 1.0)
+            let hi = math.floor(center + radius)
+            if lo < 0.0 : lo = 0.0
+            if hi > (from - 1).to(float) : hi = (from - 1).to(float)
+            let first = lo.to(uint)
+            let last = hi.to(uint)
+            let n = last >= first ? last - first + 1 : 0
+            if n > taps : n = taps
+            let sum = 0.0
+            let i: uint = 0
+            while i < n {
+                let w = filter_weight(filter, ((first + i).to(float) - center) / stretch)
+                values.set(x * taps + i, w) !!
+                sum += w
+                i++
+            }
+            if sum != 0.0 {
+                i = 0
+                while i < n {
+                    values.set(x * taps + i, values[x * taps + i] / sum) !!
+                    i++
+                }
+            }
+            start.append(first)
+            count.append(n)
+            x++
+        }
+        return SELF { start: start, count: count, values: values, taps: taps }
+    }
+}
+
+fn filter_radius(filter: Filter) float {
+    if filter == Filter.box : return 0.5
+    if filter == Filter.bilinear : return 1.0
+    if filter == Filter.bicubic : return 2.0
+    if filter == Filter.lanczos : return 3.0
+    return 0.5
+}
+
+fn filter_weight(filter: Filter, distance: float) float {
+    let d = math.abs(distance)
+    if filter == Filter.box : return d < 0.5 ? 1.0 : (d == 0.5 ? 0.5 : 0.0)
+    if filter == Filter.bilinear : return d < 1.0 ? 1.0 - d : 0.0
+    if filter == Filter.bicubic {
+        // Catmull-Rom
+        if d < 1.0 : return 1.5 * d * d * d - 2.5 * d * d + 1.0
+        if d < 2.0 : return -0.5 * d * d * d + 2.5 * d * d - 4.0 * d + 2.0
+        return 0.0
+    }
+    if filter == Filter.lanczos {
+        if d == 0.0 : return 1.0
+        if d >= 3.0 : return 0.0
+        let px = PI * d
+        return 3.0 * math.sin(px) * math.sin(px / 3.0) / (px * px)
+    }
+    return d < 0.5 ? 1.0 : 0.0
+}

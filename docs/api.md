@@ -1,0 +1,107 @@
+
+# Documentation
+
+Namespaces: [main](#main)
+
+---
+
+# main
+
+## Aliases for 'main'
+
+```js
+// The most pixels an `Image` may hold: a hostile header cannot ask for more memory.
++ value MAX_PIXELS (64 * 1024 * 1024)
+```
+
+## Errors for 'main'
+
+```js
+// Thrown by the decoders, encoders and the operations that take coordinates.
+error ImageError (invalid, unsupported, too_large, range) payload { message: String ("") }
+```
+
+## Enums for 'main'
+
+```js
+// How `resize` samples the source.
++ enum Filter { nearest, box, bilinear, bicubic, lanczos }
+```
+
+## Functions for 'main'
+
+```js
+// Decodes an image, recognizing the format from its first bytes.
++ fn decode(data: local &[u8]) Image !ImageError
+// Decodes a PNG image.
++ fn decode_png(data: local &[u8]) Image !ImageError
+// Whether `data` starts with the PNG signature.
++ fn is_png(data: local &[u8]) bool
+// Reads and decodes the image file at `path`.
++ fn read(path: String) Image !ImageError
+```
+
+## Classes for 'main'
+
+```js
+// An 8-bit image: `width` by `height` pixels of `channels` bytes each, row by row.
++ class Image {
+    // Bytes per pixel: 1, 3 or 4.
+    ~ channels: u8
+    // Rows.
+    ~ height: uint
+    // The pixel bytes, `width * height * channels` of them, top row first.
+    ~ pixels: mut &[u8]
+    // Pixels per row.
+    ~ width: uint
+
+    // Returns a copy.
+    + fn clone() Image
+    // Returns exactly `width` by `height`: the image is scaled to cover that size and the overflow is cropped away evenly on both sides.
+    + fn cover(width: uint, height: uint, filter: Filter (Filter.lanczos)) Image !ImageError
+    // Returns the `width` by `height` rectangle whose top-left corner is (`x`, `y`).
+    + fn crop(x: uint, y: uint, width: uint, height: uint) Image !ImageError
+    // Encodes the image as PNG: 8-bit gray, RGB or RGBA, one IDAT chunk.
+    + fn encode_png(level: uint (6)) String
+    // Writes the image as PNG to `out` and returns the bytes written; see `encode_png`.
+    + fn encode_png_into(out: Writer, level: uint (6)) uint !io:IoError
+    // Returns the largest image that fits inside `width` by `height` with the same proportions; an image that already fits is returned unchanged.
+    + fn fit(width: uint, height: uint, filter: Filter (Filter.lanczos)) Image !ImageError
+    // Returns the image mirrored left to right.
+    + fn flip_horizontal() Image
+    // Returns the image mirrored top to bottom.
+    + fn flip_vertical() Image
+    // Wraps existing pixel bytes; `pixels` must hold exactly `width * height * channels`.
+    + static fn from_pixels(width: uint, height: uint, channels: u8, pixels: mut &[u8]) Image !ImageError
+    // Returns channel `channel` of pixel (`x`, `y`); panics outside the image.
+    + fn get(x: uint, y: uint, channel: u8 (0)) u8
+    // Creates a black, fully transparent image. `channels` must be 1, 3 or 4.
+    + static fn new(width: uint, height: uint, channels: u8 (4)) Image !ImageError
+    // The byte offset of pixel (`x`, `y`).
+    + fn offset(x: uint, y: uint) uint
+    // Returns the image scaled to `width` by `height` with `filter`.
+    + fn resize(width: uint, height: uint, filter: Filter (Filter.lanczos)) Image !ImageError
+    // Returns the image turned upside down.
+    + fn rotate_180() Image
+    // Returns the image turned a quarter turn counter-clockwise.
+    + fn rotate_270() Image
+    // Returns the image turned a quarter turn clockwise.
+    + fn rotate_90() Image
+    // The bytes of row `y`, writable.
+    + fn row(y: uint) mut &[u8]
+    // Sets channel `channel` of pixel (`x`, `y`); panics outside the image.
+    + fn set(x: uint, y: uint, value: u8, channel: u8 (0)) void
+    // Sets every channel of pixel (`x`, `y`) from `values`, one byte per channel.
+    + fn set_pixel(x: uint, y: uint, values: local &[u8]) void
+    // Bytes per row.
+    + get stride: uint
+    // Returns a one-channel copy, weighting the channels as the eye does (Rec. 601).
+    + fn to_gray() Image
+    // Returns a three-channel copy; the alpha of an RGBA image is dropped.
+    + fn to_rgb() Image
+    // Returns a four-channel copy; the added alpha is opaque.
+    + fn to_rgba() Image
+    // Encodes the image by the extension of `path` (`.png`) and writes it there.
+    + fn write(path: String) void !ImageError
+}
+```

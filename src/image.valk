@@ -1,0 +1,242 @@
+use valk.mem
+/// Thrown by the decoders, encoders and the operations that take coordinates.
+///
+/// - `invalid`: the data is not a well-formed image of its format.
+/// - `unsupported`: a valid image uses a feature this library does not read yet
+///   (`message` names it).
+/// - `too_large`: the image has more than `MAX_PIXELS` pixels.
+/// - `range`: a coordinate or size lies outside the image.
+///
+/// The payload `message` says what was wrong.
+error ImageError (invalid, unsupported, too_large, range) payload {
+    message: String ("")
+}
+
+/// The most pixels an `Image` may hold: a hostile header cannot ask for more memory.
++ value MAX_PIXELS (64 * 1024 * 1024)
+
+/// An 8-bit image: `width` by `height` pixels of `channels` bytes each, row by row.
+///
+/// `channels` is 1 (gray), 3 (RGB) or 4 (RGBA). Every operation returns a new image and
+/// leaves the receiver as it was. An image holds only plain data, so it converts to
+/// `shared` for other threads without ceremony.
++ class Image {
+    /// Pixels per row.
+    ~ width: uint
+    /// Rows.
+    ~ height: uint
+    /// Bytes per pixel: 1, 3 or 4.
+    ~ channels: u8
+    /// The pixel bytes, `width * height * channels` of them, top row first.
+    ~ pixels: mut &[u8]
+
+    /// Creates a black, fully transparent image. `channels` must be 1, 3 or 4.
+    + static fn new(width: uint, height: uint, channels: u8 (4)) SELF !ImageError {
+        check_dimensions(width, height, channels) !>
+        let size = width * height * channels.to(uint)
+        return SELF { width: width, height: height, channels: channels, pixels: [u8]{ 0 x size } }
+    }
+
+    /// Wraps existing pixel bytes; `pixels` must hold exactly `width * height * channels`.
+    + static fn from_pixels(width: uint, height: uint, channels: u8, pixels: mut &[u8]) SELF !ImageError {
+        check_dimensions(width, height, channels) !>
+        if pixels.length != width * height * channels.to(uint) : throw .range { message: "Pixel data does not match the dimensions" }
+        return SELF { width: width, height: height, channels: channels, pixels: pixels }
+    }
+
+    /// Bytes per row.
+    + get stride: uint {
+        return this.width * this.channels.to(uint)
+    }
+
+    /// The byte offset of pixel (`x`, `y`).
+    + fn offset(x: uint, y: uint) uint {
+        return (y * this.width + x) * this.channels.to(uint)
+    }
+
+    /// Returns channel `channel` of pixel (`x`, `y`); panics outside the image.
+    + fn get(x: uint, y: uint, channel: u8 (0)) u8 {
+        if x >= this.width || y >= this.height : panic("Pixel outside the image")
+        return this.pixels[this.offset(x, y) + channel.to(uint)]
+    }
+
+    /// Sets channel `channel` of pixel (`x`, `y`); panics outside the image.
+    + fn set(x: uint, y: uint, value: u8, channel: u8 (0)) {
+        if x >= this.width || y >= this.height : panic("Pixel outside the image")
+        this.pixels[this.offset(x, y) + channel.to(uint)] = value
+    }
+
+    /// Sets every channel of pixel (`x`, `y`) from `values`, one byte per channel.
+    + fn set_pixel(x: uint, y: uint, values: local &[u8]) {
+        if x >= this.width || y >= this.height : panic("Pixel outside the image")
+        let at = this.offset(x, y)
+        let c: uint = 0
+        while c < this.channels.to(uint) && c < values.length {
+            this.pixels[at + c] = values[c]
+            c++
+        }
+    }
+
+    /// The bytes of row `y`, writable.
+    + fn row(y: uint) mut &[u8] {
+        if y >= this.height : panic("Row outside the image")
+        return this.pixels.view(y * this.stride, this.stride)
+    }
+
+    /// Returns a copy.
+    + fn clone() SELF {
+        let copy = [u8]{ 0 x this.pixels.length }
+        mem.copy(this.pixels, copy)
+        return SELF { width: this.width, height: this.height, channels: this.channels, pixels: copy }
+    }
+
+    /// Returns the `width` by `height` rectangle whose top-left corner is (`x`, `y`).
+    ///
+    /// Throws `range` when the rectangle leaves the image or is empty.
+    + fn crop(x: uint, y: uint, width: uint, height: uint) SELF !ImageError {
+        if width == 0 || height == 0 : throw .range { message: "Empty crop" }
+        if x + width > this.width || y + height > this.height : throw .range { message: "Crop outside the image" }
+        let out = SELF.new(width, height, this.channels) !>
+        let bytes = width * this.channels.to(uint)
+        let r: uint = 0
+        while r < height {
+            let src = this.pixels.view(this.offset(x, y + r), bytes)
+            mem.copy(src, out.row(r))
+            r++
+        }
+        return out
+    }
+
+    /// Returns the image mirrored left to right.
+    + fn flip_horizontal() SELF {
+        let out = SELF.new(this.width, this.height, this.channels) !!
+        let c = this.channels.to(uint)
+        let y: uint = 0
+        while y < this.height {
+            let src = this.row(y)
+            let dst = out.row(y)
+            let x: uint = 0
+            while x < this.width {
+                let from = x * c
+                let to = (this.width - 1 - x) * c
+                let k: uint = 0
+                while k < c {
+                    dst[to + k] = src[from + k]
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+        return out
+    }
+
+    /// Returns the image mirrored top to bottom.
+    + fn flip_vertical() SELF {
+        let out = SELF.new(this.width, this.height, this.channels) !!
+        let y: uint = 0
+        while y < this.height {
+            mem.copy(this.row(y), out.row(this.height - 1 - y))
+            y++
+        }
+        return out
+    }
+
+    /// Returns the image turned a quarter turn clockwise.
+    + fn rotate_90() SELF {
+        let out = SELF.new(this.height, this.width, this.channels) !!
+        this.rotate_into(out, true)
+        return out
+    }
+
+    /// Returns the image turned a quarter turn counter-clockwise.
+    + fn rotate_270() SELF {
+        let out = SELF.new(this.height, this.width, this.channels) !!
+        this.rotate_into(out, false)
+        return out
+    }
+
+    /// Returns the image turned upside down.
+    + fn rotate_180() SELF {
+        return this.flip_horizontal().flip_vertical()
+    }
+
+    - fn rotate_into(out: Image, clockwise: bool) {
+        let c = this.channels.to(uint)
+        let y: uint = 0
+        while y < this.height {
+            let x: uint = 0
+            while x < this.width {
+                let from = this.offset(x, y)
+                // Clockwise: the top row becomes the right column
+                let to = clockwise ? out.offset(this.height - 1 - y, x) : out.offset(y, this.width - 1 - x)
+                let k: uint = 0
+                while k < c {
+                    out.pixels[to + k] = this.pixels[from + k]
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+    }
+
+    /// Returns a one-channel copy, weighting the channels as the eye does (Rec. 601).
+    + fn to_gray() SELF {
+        if this.channels == 1 : return this.clone()
+        let out = SELF.new(this.width, this.height, 1) !!
+        let c = this.channels.to(uint)
+        let count = this.width * this.height
+        let i: uint = 0
+        while i < count {
+            let at = i * c
+            let r = this.pixels[at].to(uint)
+            let g = this.pixels[at + 1].to(uint)
+            let b = this.pixels[at + 2].to(uint)
+            out.pixels[i] = ((r * 299 + g * 587 + b * 114 + 500) / 1000).to(u8)
+            i++
+        }
+        return out
+    }
+
+    /// Returns a three-channel copy; the alpha of an RGBA image is dropped.
+    + fn to_rgb() SELF {
+        return this.convert(3)
+    }
+
+    /// Returns a four-channel copy; the added alpha is opaque.
+    + fn to_rgba() SELF {
+        return this.convert(4)
+    }
+
+    - fn convert(channels: u8) SELF {
+        if this.channels == channels : return this.clone()
+        let out = SELF.new(this.width, this.height, channels) !!
+        let from_c = this.channels.to(uint)
+        let to_c = channels.to(uint)
+        let count = this.width * this.height
+        let i: uint = 0
+        while i < count {
+            let src = i * from_c
+            let dst = i * to_c
+            if from_c == 1 {
+                out.pixels[dst] = this.pixels[src]
+                out.pixels[dst + 1] = this.pixels[src]
+                out.pixels[dst + 2] = this.pixels[src]
+            } else {
+                out.pixels[dst] = this.pixels[src]
+                out.pixels[dst + 1] = this.pixels[src + 1]
+                out.pixels[dst + 2] = this.pixels[src + 2]
+            }
+            if to_c == 4 : out.pixels[dst + 3] = from_c == 4 ? this.pixels[src + 3] : 255
+            i++
+        }
+        return out
+    }
+}
+
+fn check_dimensions(width: uint, height: uint, channels: u8) !ImageError {
+    if channels != 1 && channels != 3 && channels != 4 : throw .unsupported { message: "Images have 1, 3 or 4 channels" }
+    if width == 0 || height == 0 : throw .range { message: "An image needs at least one pixel" }
+    if width > MAX_PIXELS || height > MAX_PIXELS || width * height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+}

@@ -1,0 +1,28 @@
+use valk.fs
+
+/// Decodes an image, recognizing the format from its first bytes.
+///
+/// PNG is supported; a JPEG throws `unsupported` until its decoder lands, anything else
+/// `invalid`.
++ fn decode(data: local &[u8]) Image !ImageError {
+    if is_png(data) : return decode_png(data) !>
+    if data.length >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff : throw .unsupported { message: "JPEG" }
+    throw .invalid { message: "Unknown image format" }
+}
+
+/// Reads and decodes the image file at `path`.
+///
+/// Throws `invalid` when the file cannot be read, with the reason in `message`.
++ fn read(path: String) Image !ImageError {
+    let data = fs.read(path) ! throw .invalid { message: "Cannot read " + path }
+    return decode(data) !>
+}
+
+extend Image {
+    /// Encodes the image by the extension of `path` (`.png`) and writes it there.
+    + fn write(path: String) !ImageError {
+        let ext = fs.extension(path).lower()
+        if ext != "png" : throw .unsupported { message: "Writing ." + ext + " files" }
+        fs.write(path, this.encode_png()) ! throw .invalid { message: "Cannot write " + path }
+    }
+}

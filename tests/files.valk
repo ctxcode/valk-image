@@ -1,0 +1,14 @@
+use image
+use valk.fs
+
+test "Files: write and read a PNG by path" {
+    let path = fs.add(fs.exe_dir() !? ".", "image-test-round-trip.png")
+    let img = image.Image.new(3, 3, 4) !!
+    img.set_pixel(1, 1, .{ 1, 2, 3, 4 })
+    img.write(path) !!
+    let back = image.read(path) !!
+    assert(back.get(1, 1, 2) == 3 && back.get(1, 1, 3) == 4 && back.get(0, 0, 3) == 0)
+    fs.delete_file(path) ! {}
+    img.write("x.jpg") ! assert(E.code == E.unsupported)
+    image.read("/nonexistent/none.png") ! assert(E.code == E.invalid)
+}

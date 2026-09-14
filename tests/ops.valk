@@ -1,0 +1,128 @@
+use image
+use valk.mem
+
+// A 3x2 RGB image whose pixel (x, y) is (x, y, x + y)
+fn sample_image() image.Image {
+    let img = image.Image.new(3, 2, 3) !!
+    let y: uint = 0
+    while y < 2 {
+        let x: uint = 0
+        while x < 3 {
+            img.set_pixel(x, y, .{ x.to(u8), y.to(u8), (x + y).to(u8) })
+            x++
+        }
+        y++
+    }
+    return img
+}
+
+test "Image: creation, access and conversion" {
+    let img = sample_image()
+    assert(img.stride == 9 && img.pixels.length == 18)
+    assert(img.get(2, 1, 0) == 2 && img.get(2, 1, 1) == 1 && img.get(2, 1, 2) == 3)
+    assert(img.row(1).length == 9 && img.row(1)[3] == 1)
+    let copy = img.clone()
+    copy.set(0, 0, 200)
+    assert(img.get(0, 0) == 0 && copy.get(0, 0) == 200)
+
+    let rgba = img.to_rgba()
+    assert(rgba.channels == 4 && rgba.get(2, 1, 3) == 255 && rgba.get(2, 1, 2) == 3)
+    let rgb = rgba.to_rgb()
+    assert(mem.equals(rgb.pixels, img.pixels))
+    let gray = image.Image.new(1, 1, 3) !!
+    gray.set_pixel(0, 0, .{ 255, 255, 255 })
+    assert(gray.to_gray().get(0, 0) == 255)
+    let dark = image.Image.new(1, 1, 3) !!
+    dark.set_pixel(0, 0, .{ 100, 0, 0 })
+    assert(dark.to_gray().get(0, 0) == 30) // 100 * 0.299
+    assert(dark.to_gray().to_rgb().get(0, 0, 2) == 30)
+
+    image.Image.new(0, 5) ! assert(E.code == E.range)
+    image.Image.new(5, 5, 2) ! assert(E.code == E.unsupported)
+    image.Image.new(100_000, 100_000) ! assert(E.code == E.too_large)
+}
+
+test "Image: crop, flips and rotations" {
+    let img = sample_image()
+    let c = img.crop(1, 0, 2, 2) !!
+    assert(c.width == 2 && c.height == 2)
+    assert(c.get(0, 0, 0) == 1 && c.get(1, 1, 0) == 2 && c.get(1, 1, 1) == 1)
+    img.crop(2, 0, 2, 1) ! assert(E.code == E.range)
+    img.crop(0, 0, 0, 1) ! assert(E.code == E.range)
+
+    let h = img.flip_horizontal()
+    assert(h.get(0, 0, 0) == 2 && h.get(2, 0, 0) == 0 && h.get(0, 1, 1) == 1)
+    let v = img.flip_vertical()
+    assert(v.get(0, 0, 1) == 1 && v.get(0, 1, 1) == 0)
+    assert(mem.equals(v.flip_vertical().pixels, img.pixels))
+
+    // Clockwise: the top row (y = 0) becomes the right column
+    let r = img.rotate_90()
+    assert(r.width == 2 && r.height == 3)
+    assert(r.get(1, 0, 0) == 0 && r.get(1, 0, 1) == 0) // pixel (0,0) -> (1,0)
+    assert(r.get(0, 2, 0) == 2 && r.get(0, 2, 1) == 1) // pixel (2,1) -> (0,2)
+    let l = img.rotate_270()
+    assert(l.get(0, 2, 0) == 0 && l.get(0, 2, 1) == 0) // pixel (0,0) -> (0,2)
+    assert(mem.equals(r.rotate_270().pixels, img.pixels))
+    assert(mem.equals(img.rotate_180().pixels, r.rotate_90().pixels))
+}
+
+test "Image: resize filters" {
+    let img = sample_image()
+    // Nearest doubles pixels exactly
+    let big = img.resize(6, 4, image.Filter.nearest) !!
+    assert(big.get(0, 0, 0) == 0 && big.get(1, 0, 0) == 0 && big.get(2, 0, 0) == 1 && big.get(5, 3, 2) == 3)
+    // Same size is a copy for every filter
+    let filters = Array[image.Filter]{ image.Filter.nearest, image.Filter.box, image.Filter.bilinear, image.Filter.bicubic, image.Filter.lanczos }
+    each filters as f : assert(mem.equals((img.resize(3, 2, f) !!).pixels, img.pixels))
+
+    // Box downscale of a 2x2 block averages it
+    let quad = image.Image.new(2, 2, 1) !!
+    quad.set(0, 0, 10)
+    quad.set(1, 0, 20)
+    quad.set(0, 1, 30)
+    quad.set(1, 1, 40)
+    assert((quad.resize(1, 1, image.Filter.box) !!).get(0, 0) == 25)
+    assert((quad.resize(1, 1, image.Filter.bilinear) !!).get(0, 0) == 25)
+
+    // A flat image stays flat under every filter, up and down
+    let flat = image.Image.new(7, 5, 3) !!
+    let i: uint = 0
+    while i < flat.pixels.length {
+        flat.pixels[i] = 123
+        i++
+    }
+    each filters as f {
+        let up = flat.resize(19, 11, f) !!
+        let down = flat.resize(2, 3, f) !!
+        each up.pixels as p : assert(p == 123)
+        each down.pixels as p : assert(p == 123)
+    }
+
+    // Upscaling a two-tone gradient keeps its ends and stays monotonic
+    let ramp = image.Image.new(2, 1, 1) !!
+    ramp.set(0, 0, 0)
+    ramp.set(1, 0, 200)
+    let wide = ramp.resize(8, 1, image.Filter.bilinear) !!
+    assert(wide.get(0, 0) == 0 && wide.get(7, 0) == 200)
+    let x: uint = 1
+    while x < 8 {
+        assert(wide.get(x, 0) >= wide.get(x - 1, 0))
+        x++
+    }
+    img.resize(0, 1) ! assert(E.code == E.range)
+}
+
+test "Image: fit and cover" {
+    let wide = image.Image.new(200, 100, 3) !!
+    let f = wide.fit(50, 50) !!
+    assert(f.width == 50 && f.height == 25)
+    let tall = image.Image.new(100, 400, 1) !!
+    let t = tall.fit(50, 50, image.Filter.nearest) !!
+    assert(t.width == 13 && t.height == 50)
+    assert((wide.fit(300, 300) !!).width == 200)
+    let c = wide.cover(50, 50) !!
+    assert(c.width == 50 && c.height == 50)
+    let c2 = tall.cover(30, 20, image.Filter.box) !!
+    assert(c2.width == 30 && c2.height == 20)
+}

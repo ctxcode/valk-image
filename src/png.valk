@@ -1,0 +1,314 @@
+use valk.io
+use valk.mem
+use valk.compress
+
+value PNG_SIGNATURE ("\x89PNG\r\n\x1a\n")
+
+extend Image {
+    /// Encodes the image as PNG: 8-bit gray, RGB or RGBA, one IDAT chunk.
+    + fn encode_png(level: uint (6)) String {
+        let out = ByteBuffer.new(this.pixels.length / 2 + 64)
+        this.encode_png_into(out, level) ! panic("A ByteBuffer write cannot fail")
+        return out.into_string()
+    }
+
+    /// Writes the image as PNG to `out` and returns the bytes written; see `encode_png`.
+    + fn encode_png_into(out: io.Writer, level: uint (6)) uint !io.IoError {
+        let buf = ByteBuffer.new(this.pixels.length / 2 + 64)
+        buf.write(PNG_SIGNATURE)
+        let header = ByteBuffer.new(13)
+        header.write_u32_be(this.width.to(u32))
+        header.write_u32_be(this.height.to(u32))
+        header.write_byte(8)
+        header.write_byte(this.channels == 1 ? 0 : (this.channels == 3 ? 2 : 6))
+        header.write_byte(0)
+        header.write_byte(0)
+        header.write_byte(0)
+        write_png_chunk(buf, "IHDR", header)
+        // Each row is preceded by its filter type; `Sub` predicts from the pixel to the
+        // left, which compresses photos and gradients far better than no filter
+        let stride = this.stride
+        let c = this.channels.to(uint)
+        let raw = ByteBuffer.new((stride + 1) * this.height)
+        let y: uint = 0
+        while y < this.height {
+            let row = this.row(y)
+            raw.write_byte(1)
+            let x: uint = 0
+            while x < stride {
+                let left = x >= c ? row[x - c] : 0
+                raw.write_byte(row[x] - left)
+                x++
+            }
+            y++
+        }
+        write_png_chunk(buf, "IDAT", compress.zlib(raw, level))
+        write_png_chunk(buf, "IEND", "")
+        return out.write(buf) !>
+    }
+}
+
+fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
+    out.write_u32_be(data.length.to(u32))
+    out.write(type)
+    out.write(data)
+    let crc = compress.crc32(data, compress.crc32(type))
+    out.write_u32_be(crc)
+}
+
+/// Whether `data` starts with the PNG signature.
++ fn is_png(data: local &[u8]) bool {
+    if data.length < 8 : return false
+    return mem.equals(data.view(0, 8), PNG_SIGNATURE)
+}
+
+/// Decodes a PNG image.
+///
+/// Reads every bit depth and color type, palettes and `tRNS` transparency; 16-bit samples
+/// are reduced to 8 bits. Gray becomes a 1-channel image, gray with alpha and palettes
+/// with transparency become RGBA, the rest RGB or RGBA as stored. Interlaced (Adam7) files
+/// throw `unsupported`; malformed files throw `invalid` with a message naming the chunk.
++ fn decode_png(data: local &[u8]) Image !ImageError {
+    if !is_png(data) : throw .invalid { message: "Not a PNG file" }
+    let pos: uint = 8
+    let width: uint = 0
+    let height: uint = 0
+    let bit_depth: u8 = 0
+    let color_type: u8 = 0
+    let interlace: u8 = 0
+    let palette: ?String = null
+    let trns: ?String = null
+    let idat = ByteBuffer.new(data.length)
+    let seen_header = false
+    let seen_end = false
+    while !seen_end {
+        if pos + 12 > data.length : throw .invalid { message: "Truncated chunk" }
+        let length = read_u32_be(data, pos).to(uint)
+        let type = data.view(pos + 4, 4).to_string()
+        if pos + 12 + length > data.length : throw .invalid { message: "Truncated " + type + " chunk" }
+        let body = data.view(pos + 8, length)
+        let crc = read_u32_be(data, pos + 8 + length)
+        if crc != compress.crc32(body, compress.crc32(type)) : throw .invalid { message: "Bad CRC in " + type + " chunk" }
+        if type == "IHDR" {
+            if length != 13 : throw .invalid { message: "IHDR chunk has the wrong size" }
+            width = read_u32_be(body, 0).to(uint)
+            height = read_u32_be(body, 4).to(uint)
+            bit_depth = body[8]
+            color_type = body[9]
+            if body[10] != 0 || body[11] != 0 : throw .invalid { message: "Unknown compression or filter method" }
+            interlace = body[12]
+            seen_header = true
+        } else if type == "PLTE" {
+            palette = body.to_string()
+        } else if type == "tRNS" {
+            trns = body.to_string()
+        } else if type == "IDAT" {
+            idat.write(body)
+        } else if type == "IEND" {
+            seen_end = true
+        }
+        // Ancillary chunks (text, gamma, ...) are skipped
+        pos += 12 + length
+    }
+    if !seen_header : throw .invalid { message: "Missing IHDR chunk" }
+    if interlace != 0 : throw .unsupported { message: "Interlaced (Adam7) PNG" }
+    if width == 0 || height == 0 || width > MAX_PIXELS || height > MAX_PIXELS || width * height > MAX_PIXELS {
+        throw .too_large { message: "The image exceeds MAX_PIXELS" }
+    }
+
+    // Samples per pixel as stored, and the channels of the image produced
+    let samples: uint = 0
+    let out_channels: u8 = 0
+    if color_type == 0 {
+        samples = 1
+        out_channels = isset(trns) ? 4 : 1
+    } else if color_type == 2 {
+        samples = 3
+        out_channels = isset(trns) ? 4 : 3
+    } else if color_type == 3 {
+        samples = 1
+        if !isset(palette) : throw .invalid { message: "Palette image without a PLTE chunk" }
+        out_channels = isset(trns) ? 4 : 3
+    } else if color_type == 4 {
+        samples = 2
+        out_channels = 4
+    } else if color_type == 6 {
+        samples = 4
+        out_channels = 4
+    } else {
+        throw .invalid { message: "Unknown color type" }
+    }
+    if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 && bit_depth != 16 : throw .invalid { message: "Unknown bit depth" }
+    if (color_type == 2 || color_type == 4 || color_type == 6) && bit_depth < 8 : throw .invalid { message: "Bit depth too small for the color type" }
+    if color_type == 3 && bit_depth == 16 : throw .invalid { message: "16-bit palette" }
+
+    let bits_per_pixel = samples * bit_depth.to(uint)
+    let stride = (width * bits_per_pixel + 7) / 8
+    let bytes_per_pixel = bits_per_pixel < 8 ? 1 : bits_per_pixel / 8
+    let raw_size = (stride + 1) * height
+    let raw = compress.unzlib(idat, raw_size) ! throw .invalid { message: "Corrupt image data" }
+    if raw.bytes != raw_size : throw .invalid { message: "Image data has the wrong size" }
+
+    // Undo the row filters in place, each row against the one above
+    let rows = [u8]{ 0 x raw_size }
+    mem.copy(raw, rows)
+    unfilter_rows(rows, height, stride, bytes_per_pixel) !>
+
+    let image = Image.new(width, height, out_channels) !>
+    let y: uint = 0
+    while y < height {
+        let row = rows.view(y * (stride + 1) + 1, stride)
+        let dst = image.row(y)
+        expand_row(row, dst, width, color_type, bit_depth, out_channels, palette, trns)
+        y++
+    }
+    return image
+}
+
+fn read_u32_be(data: local &[u8], at: uint) u32 {
+    return (data[at].to(u32) << 24) | (data[at + 1].to(u32) << 16) | (data[at + 2].to(u32) << 8) | data[at + 3].to(u32)
+}
+
+fn unfilter_rows(rows: local mut &[u8], height: uint, stride: uint, bpp: uint) !ImageError {
+    let y: uint = 0
+    while y < height {
+        let base = y * (stride + 1)
+        let filter = rows[base]
+        let start = base + 1
+        let prev_start = start - stride - 1
+        let x: uint = 0
+        while x < stride {
+            let at = start + x
+            let a: uint = x >= bpp ? rows[at - bpp].to(uint) : 0
+            let b: uint = y > 0 ? rows[prev_start + x].to(uint) : 0
+            let c: uint = (y > 0 && x >= bpp) ? rows[prev_start + x - bpp].to(uint) : 0
+            let value = rows[at].to(uint)
+            if filter == 0 {
+            } else if filter == 1 {
+                value += a
+            } else if filter == 2 {
+                value += b
+            } else if filter == 3 {
+                value += (a + b) / 2
+            } else if filter == 4 {
+                value += paeth(a, b, c)
+            } else {
+                throw .invalid { message: "Unknown row filter" }
+            }
+            rows[at] = (value & 255).to(u8)
+            x++
+        }
+        y++
+    }
+}
+
+fn paeth(a: uint, b: uint, c: uint) uint {
+    let p = a.to(int) + b.to(int) - c.to(int)
+    let pa = abs_int(p - a.to(int))
+    let pb = abs_int(p - b.to(int))
+    let pc = abs_int(p - c.to(int))
+    if pa <= pb && pa <= pc : return a
+    if pb <= pc : return b
+    return c
+}
+
+fn abs_int(v: int) int {
+    return v < 0 ? 0 - v : v
+}
+
+// Reads sample `index` of a row stored at `bit_depth` bits, scaled to 8 bits
+fn sample(row: local &[u8], index: uint, bit_depth: u8) u8 {
+    if bit_depth == 8 : return row[index]
+    if bit_depth == 16 : return row[index * 2]
+    let depth = bit_depth.to(uint)
+    let bit = index * depth
+    let byte = row[bit / 8].to(uint)
+    let shift = 8 - depth - (bit % 8)
+    let raw = (byte >> shift) & ((1 << depth) - 1)
+    // Scale 0..max to 0..255
+    return (raw * 255 / ((1 << depth) - 1)).to(u8)
+}
+
+fn expand_row(row: local &[u8], dst: local mut &[u8], width: uint, color_type: u8, bit_depth: u8, channels: u8, palette: ?String, trns: ?String) {
+    let c = channels.to(uint)
+    let x: uint = 0
+    while x < width {
+        let at = x * c
+        if color_type == 0 {
+            let v = sample(row, x, bit_depth)
+            dst[at] = v
+            if c == 4 {
+                dst[at + 1] = v
+                dst[at + 2] = v
+                dst[at + 3] = gray_alpha(row, x, bit_depth, trns)
+            }
+        } else if color_type == 2 {
+            let step: uint = bit_depth == 16 ? 6 : 3
+            let base = x * step
+            let stride: uint = bit_depth == 16 ? 2 : 1
+            dst[at] = row[base]
+            dst[at + 1] = row[base + stride]
+            dst[at + 2] = row[base + stride * 2]
+            if c == 4 : dst[at + 3] = rgb_alpha(row, base, stride, trns)
+        } else if color_type == 3 {
+            let depth = bit_depth.to(uint)
+            let bit = x * depth
+            let byte = row[bit / 8].to(uint)
+            let index = bit_depth == 8 ? byte : (byte >> (8 - depth - (bit % 8))) & ((1 << depth) - 1)
+            let pal = palette ?? ""
+            let p = index * 3
+            dst[at] = p + 2 < pal.bytes ? pal[p] : 0
+            dst[at + 1] = p + 2 < pal.bytes ? pal[p + 1] : 0
+            dst[at + 2] = p + 2 < pal.bytes ? pal[p + 2] : 0
+            if c == 4 {
+                let t = trns ?? ""
+                dst[at + 3] = index < t.bytes ? t[index] : 255
+            }
+        } else if color_type == 4 {
+            let step: uint = bit_depth == 16 ? 4 : 2
+            let v = row[x * step]
+            dst[at] = v
+            dst[at + 1] = v
+            dst[at + 2] = v
+            dst[at + 3] = row[x * step + (bit_depth == 16 ? 2 : 1)]
+        } else {
+            let step: uint = bit_depth == 16 ? 8 : 4
+            let stride: uint = bit_depth == 16 ? 2 : 1
+            let base = x * step
+            dst[at] = row[base]
+            dst[at + 1] = row[base + stride]
+            dst[at + 2] = row[base + stride * 2]
+            dst[at + 3] = row[base + stride * 3]
+        }
+        x++
+    }
+}
+
+// The alpha of a gray sample against a `tRNS` chunk naming one transparent gray level
+fn gray_alpha(row: local &[u8], x: uint, bit_depth: u8, trns: ?String) u8 {
+    let t = trns ?? ""
+    if t.bytes < 2 : return 255
+    let key = (t[0].to(uint) << 8) | t[1].to(uint)
+    let value: uint = 0
+    if bit_depth == 16 : value = (row[x * 2].to(uint) << 8) | row[x * 2 + 1].to(uint)
+    else if bit_depth == 8 : value = row[x].to(uint)
+    else {
+        let depth = bit_depth.to(uint)
+        let bit = x * depth
+        value = (row[bit / 8].to(uint) >> (8 - depth - (bit % 8))) & ((1 << depth) - 1)
+    }
+    return value == key ? 0 : 255
+}
+
+fn rgb_alpha(row: local &[u8], base: uint, stride: uint, trns: ?String) u8 {
+    let t = trns ?? ""
+    if t.bytes < 6 : return 255
+    let k: uint = 0
+    while k < 3 {
+        let key = (t[k * 2].to(uint) << 8) | t[k * 2 + 1].to(uint)
+        let value = stride == 2 ? ((row[base + k * 2].to(uint) << 8) | row[base + k * 2 + 1].to(uint)) : row[base + k].to(uint)
+        if value != key : return 255
+        k++
+    }
+    return 0
+}
