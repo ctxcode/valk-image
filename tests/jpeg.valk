@@ -35,6 +35,24 @@ test "JPEG: progressive files decode within 2 levels of libjpeg" {
     image.decode_jpeg(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)
 }
 
+test "JPEG: EXIF orientation turns the picture upright" {
+    // The same baseline picture with an APP1 segment for each orientation, little-endian
+    // for the odd ones and big-endian for the even ones; references come from ImageMagick
+    let o: uint = 1
+    while o <= 8 {
+        let data = asset("photo-orient-" + o + ".jpg")
+        assert(image.jpeg_orientation(data) == o)
+        let ours = image.decode(data) !!
+        let ref = image.decode_png(asset("photo-orient-" + o + "-ref.png")) !!
+        // Orientations 5 to 8 involve a quarter turn, so the sides swap
+        assert(ours.width == (o >= 5 ? 29 : 37) && ours.height == (o >= 5 ? 37 : 29))
+        assert(max_diff(ours, ref) <= 1)
+        o++
+    }
+    assert(image.jpeg_orientation(asset("photo-444.jpg")) == 1)
+    assert(image.jpeg_orientation("not a jpeg") == 1)
+}
+
 test "JPEG: unsupported and malformed files are reported" {
     image.decode_jpeg(asset("photo-arith.jpg")) ! {
         assert(E.code == E.unsupported)

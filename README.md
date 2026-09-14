@@ -53,6 +53,7 @@ can fail throw `ImageError`, with the reason in `E.message`.
 | `image.decode(data)` | Decodes bytes, recognizing the format from the first bytes |
 | `image.decode_png(data)`, `decode_jpeg`, `decode_bmp` | Decode one format |
 | `image.is_png(data)`, `is_jpeg`, `is_bmp` | Check what the bytes are |
+| `image.jpeg_orientation(data)` | The EXIF orientation tag, 1 to 8 |
 | `img.encode_png(level (6))` | PNG bytes; `level` is the compression level 0-9 |
 | `img.encode_jpeg(quality (85), subsample_chroma (true))` | JPEG bytes; quality 1-100 |
 | `img.encode_bmp()` | BMP bytes |
@@ -62,7 +63,7 @@ Every `encode_*` has an `encode_*_into(writer)` twin that writes to any `io.Writ
 | Format | Reads | Writes |
 |---|---|---|
 | PNG | all bit depths and color types, palettes, transparency, interlaced | 8-bit gray, RGB, RGBA |
-| JPEG | baseline and progressive, any chroma sampling | baseline gray or YCbCr |
+| JPEG | baseline and progressive, any chroma sampling, turned upright by EXIF orientation | baseline gray or YCbCr |
 | BMP | uncompressed 1 to 32-bit, including bit-field masks | 8-bit gray, 24-bit RGB, 32-bit RGBA |
 
 ### Image

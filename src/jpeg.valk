@@ -26,14 +26,91 @@ value FAST_BITS (9)
 ///
 /// Reads baseline and progressive Huffman-coded 8-bit files with one component (gray) or
 /// three (YCbCr, or RGB when an Adobe marker says so), any chroma sampling factors and
-/// restart intervals. Subsampled chroma is upsampled bilinearly. Arithmetic-coded,
-/// lossless, 12-bit and CMYK files throw `unsupported`; malformed files throw `invalid`.
+/// restart intervals. Subsampled chroma is upsampled bilinearly. A picture stored
+/// sideways or mirrored, as phones do, is turned upright by its EXIF orientation tag.
+/// Arithmetic-coded, lossless, 12-bit and CMYK files throw `unsupported`; malformed
+/// files throw `invalid`.
 + fn decode_jpeg(data: local &[u8]) Image !ImageError {
     if !is_jpeg(data) : throw .invalid { message: "Not a JPEG file" }
     let bytes = [u8]{ 0 x data.length }
     mem.copy(data, bytes)
     let decoder = Decoder{ data: bytes }
-    return decoder.decode() !>
+    let image = decoder.decode() !>
+    return orient(image, decoder.orientation)
+}
+
+/// Returns the EXIF orientation of a JPEG, 1 to 8, or 1 when the file has none.
+///
+/// `decode_jpeg` already turns the picture upright; this is for callers that want to
+/// know whether it did. 1 is upright, 3 upside down, 6 and 8 need a quarter turn, 2, 4,
+/// 5 and 7 are mirrored.
++ fn jpeg_orientation(data: local &[u8]) uint {
+    if !is_jpeg(data) : return 1
+    let pos: uint = 2
+    while pos + 4 <= data.length {
+        if data[pos] != 0xff : return 1
+        let marker = data[pos + 1]
+        if marker == 0xff {
+            pos++
+            continue
+        }
+        // The scan starts the entropy-coded data: no more metadata after it
+        if marker == 0xda || marker == 0xd9 : return 1
+        let length = (data[pos + 2].to(uint) << 8) | data[pos + 3].to(uint)
+        if length < 2 || pos + 2 + length > data.length : return 1
+        if marker == 0xe1 : return exif_orientation(data.view(pos + 4, length - 2))
+        pos += 2 + length
+    }
+    return 1
+}
+
+// The orientation tag of an APP1 segment, 1 when it is not EXIF or has no such tag
+fn exif_orientation(segment: local &[u8]) uint {
+    if segment.length < 14 || !mem.equals(segment.view(0, 6), "Exif\x00\x00") : return 1
+    let tiff = segment.view(6, segment.length - 6)
+    let little = tiff[0] == 'I' && tiff[1] == 'I'
+    if !little && !(tiff[0] == 'M' && tiff[1] == 'M') : return 1
+    if tiff_u16(tiff, 2, little) != 42 : return 1
+    let ifd = tiff_u32(tiff, 4, little)
+    if ifd + 2 > tiff.length : return 1
+    let count = tiff_u16(tiff, ifd, little)
+    let i: uint = 0
+    while i < count {
+        let at = ifd + 2 + i * 12
+        if at + 12 > tiff.length : return 1
+        if tiff_u16(tiff, at, little) == 0x0112 {
+            // Type SHORT, one value, stored in the entry itself
+            if tiff_u16(tiff, at + 2, little) != 3 || tiff_u32(tiff, at + 4, little) != 1 : return 1
+            let value = tiff_u16(tiff, at + 8, little)
+            return value >= 1 && value <= 8 ? value : 1
+        }
+        i++
+    }
+    return 1
+}
+
+fn tiff_u16(data: local &[u8], at: uint, little: bool) uint {
+    if at + 2 > data.length : return 0
+    if little : return data[at].to(uint) | (data[at + 1].to(uint) << 8)
+    return (data[at].to(uint) << 8) | data[at + 1].to(uint)
+}
+
+fn tiff_u32(data: local &[u8], at: uint, little: bool) uint {
+    if at + 4 > data.length : return 0
+    if little : return data[at].to(uint) | (data[at + 1].to(uint) << 8) | (data[at + 2].to(uint) << 16) | (data[at + 3].to(uint) << 24)
+    return (data[at].to(uint) << 24) | (data[at + 1].to(uint) << 16) | (data[at + 2].to(uint) << 8) | data[at + 3].to(uint)
+}
+
+// Turns a decoded picture upright for its EXIF orientation
+fn orient(image: Image, orientation: uint) Image {
+    if orientation == 2 : return image.flip_horizontal()
+    if orientation == 3 : return image.rotate_180()
+    if orientation == 4 : return image.flip_vertical()
+    if orientation == 5 : return image.rotate_90().flip_horizontal()
+    if orientation == 6 : return image.rotate_90()
+    if orientation == 7 : return image.rotate_90().flip_vertical()
+    if orientation == 8 : return image.rotate_270()
+    return image
 }
 
 extend Image {
@@ -157,6 +234,8 @@ class Decoder {
     adobe_transform: int (-1)
     seen_frame: bool (false)
     progressive: bool (false)
+    // From the EXIF APP1 segment; applied after decoding
+    orientation: uint (1)
     // The current scan: spectral band `ss..se` and the successive approximation bit
     // positions (`ah` previous, `al` this scan); `eobrun` counts blocks with no more
     // coefficients in the band
@@ -200,6 +279,9 @@ class Decoder {
                 this.parse_scan(segment) !>
                 this.decode_scan() !>
                 seen_scan = true
+            } else if marker == 0xe1 {
+                let orientation = exif_orientation(segment)
+                if orientation != 1 : this.orientation = orientation
             } else if marker == 0xee {
                 if segment.length >= 12 && mem.equals(segment.view(0, 5), "Adobe") : this.adobe_transform = segment[11].to(int)
             }

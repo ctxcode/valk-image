@@ -45,6 +45,8 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 + fn is_jpeg(data: local &[u8]) bool
 // Whether `data` starts with the PNG signature.
 + fn is_png(data: local &[u8]) bool
+// Returns the EXIF orientation of a JPEG, 1 to 8, or 1 when the file has none.
++ fn jpeg_orientation(data: local &[u8]) uint
 // Reads and decodes the image file at `path`.
 + fn read(path: String) Image !ImageError
 ```
