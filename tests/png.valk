@@ -1,11 +1,6 @@
 use image
 use valk.mem
 
-fn asset(name: String) String {
-    let files = #embed_dir("assets")
-    return files.get(name) !? ""
-}
-
 test "PNG: RGBA with every row filter decodes to the expected pixels" {
     let img = image.decode(asset("rgba-filters.png")) !!
     assert(img.width == 4 && img.height == 3 && img.channels == 4)
@@ -54,11 +49,26 @@ test "PNG: RGB, gray, 1-bit, palette, gray+alpha, 16-bit and tRNS" {
     assert(keyed.get(0, 0, 3) == 0 && keyed.get(1, 0, 3) == 255 && keyed.get(2, 0, 3) == 0)
 }
 
-test "PNG: malformed and unsupported files are reported" {
-    image.decode_png(asset("interlaced.png")) ! {
-        assert(E.code == E.unsupported)
-        assert(E.message.contains("Adam7"))
-    }
+test "PNG: interlaced (Adam7) files decode like their plain versions" {
+    let plain = image.decode_png(asset("photo.png")) !!
+    let interlaced = image.decode_png(asset("photo-adam7.png")) !!
+    assert(interlaced.width == 37 && interlaced.height == 29 && interlaced.channels == 3)
+    assert(mem.equals(plain.pixels, interlaced.pixels))
+
+    // 4-bit palette, and 16-bit RGBA, both interlaced
+    let pal = image.decode_png(asset("photo-adam7-pal4.png")) !!
+    let pal_ref = image.decode_png(asset("photo-adam7-pal4-ref.png")) !!
+    assert(pal.channels == 3 && mem.equals(pal.pixels, pal_ref.pixels))
+    let deep = image.decode_png(asset("photo-adam7-16.png")) !!
+    let deep_ref = image.decode_png(asset("photo-32-ref.png")) !!
+    assert(deep.channels == 4 && mem.equals(deep.pixels, deep_ref.pixels))
+
+    // A single pixel only exists in the first pass; the other six are empty
+    let one = image.decode_png(asset("one-adam7.png")) !!
+    assert(one.width == 1 && one.height == 1 && one.get(0, 0, 0) == 255 && one.get(0, 0, 1) == 0)
+}
+
+test "PNG: malformed files are reported" {
     image.decode_png(asset("bad-crc.png")) ! {
         assert(E.code == E.invalid)
         assert(E.message.contains("CRC"))
@@ -66,9 +76,8 @@ test "PNG: malformed and unsupported files are reported" {
     image.decode("not an image") ! {
         assert(E.code == E.invalid)
     }
-    image.decode("\xff\xd8\xff\xe0") ! {
-        assert(E.code == E.unsupported)
-        assert(E.message == "JPEG")
+    image.decode("GIF89a") ! {
+        assert(E.code == E.invalid)
     }
     image.decode_png("\x89PNG\r\n\x1a\n") ! {
         assert(E.code == E.invalid)

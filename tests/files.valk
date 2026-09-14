@@ -9,6 +9,25 @@ test "Files: write and read a PNG by path" {
     let back = image.read(path) !!
     assert(back.get(1, 1, 2) == 3 && back.get(1, 1, 3) == 4 && back.get(0, 0, 3) == 0)
     fs.delete_file(path) ! {}
-    img.write("x.jpg") ! assert(E.code == E.unsupported)
+    img.write("x.gif") ! assert(E.code == E.unsupported)
     image.read("/nonexistent/none.png") ! assert(E.code == E.invalid)
+}
+
+test "Files: the extension picks JPEG and BMP" {
+    let img = image.Image.new(9, 7, 3) !!
+    img.set_pixel(4, 3, .{ 200, 100, 50 })
+    let dir = fs.exe_dir() !? "."
+    let jpg = fs.add(dir, "image-test-round-trip.jpg")
+    let bmp = fs.add(dir, "image-test-round-trip.bmp")
+    img.write(jpg) !!
+    img.write(bmp) !!
+    let from_jpg = image.read(jpg) !!
+    let from_bmp = image.read(bmp) !!
+    assert(from_jpg.width == 9 && from_jpg.height == 7 && from_jpg.channels == 3)
+    assert(from_bmp.width == 9 && from_bmp.height == 7 && from_bmp.channels == 3)
+    assert(from_bmp.get(4, 3, 0) == 200 && from_bmp.get(4, 3, 2) == 50)
+    // Lossy, but the bright pixel still stands out against the black corner
+    assert(from_jpg.get(4, 3, 0) > from_jpg.get(0, 0, 0) + 30)
+    fs.delete_file(jpg) ! {}
+    fs.delete_file(bmp) ! {}
 }

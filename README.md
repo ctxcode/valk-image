@@ -7,9 +7,9 @@ no native libraries, so it cross-compiles like any other package.
 use image
 
 fn main() {
-    let photo = image.read("photo.png") ! panic("Cannot read photo")
+    let photo = image.read("photo.jpg") ! panic("Cannot read photo")
     let thumb = photo.cover(300, 200) ! panic("Cannot resize")
-    thumb.write("thumb.png") ! panic("Cannot write thumbnail")
+    thumb.write("thumb.jpg") ! panic("Cannot write thumbnail")
 }
 ```
 
@@ -20,9 +20,15 @@ fn main() {
 - `crop`, `flip_horizontal`, `flip_vertical`, `rotate_90`, `rotate_180`, `rotate_270`.
 - `resize(width, height, filter)` with `nearest`, `box`, `bilinear`, `bicubic` and
   `lanczos` filters, plus `fit` (largest that fits) and `cover` (fill and crop).
-- PNG: `decode_png` reads every bit depth and color type, palettes and transparency;
-  `encode_png` writes 8-bit gray, RGB or RGBA. Interlaced files are not read yet.
-- `decode` sniffs the format, `read(path)` and `Image.write(path)` go through files.
+- PNG: `decode_png` reads every bit depth and color type, palettes, transparency and
+  interlacing; `encode_png` writes 8-bit gray, RGB or RGBA.
+- JPEG: `decode_jpeg` reads baseline files (gray and YCbCr, any chroma sampling, restart
+  markers); `encode_jpeg(quality)` writes baseline gray or 4:2:0 YCbCr, or 4:4:4 with
+  `subsample_chroma: false`. Progressive files are not read yet.
+- BMP: `decode_bmp` reads uncompressed 1 to 32-bit files including bit-field masks;
+  `encode_bmp` writes 8-bit gray, 24-bit RGB or 32-bit RGBA.
+- `decode` sniffs the format, `read(path)` and `Image.write(path)` go through files and
+  pick the encoder by extension.
 
 Every operation returns a new image. An `Image` holds only plain data, so it can be
 converted to `shared` and handed to another thread.

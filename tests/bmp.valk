@@ -1,0 +1,67 @@
+use image
+use valk.mem
+
+test "BMP: every uncompressed depth decodes to the reference pixels" {
+    let photo = image.decode_png(asset("photo.png")) !!
+    let plain = image.decode(asset("photo-24.bmp")) !!
+    assert(plain.channels == 3 && mem.equals(plain.pixels, photo.pixels))
+    let top_down = image.decode_bmp(asset("photo-24-topdown.bmp")) !!
+    assert(mem.equals(top_down.pixels, photo.pixels))
+
+    // 32-bit with an alpha mask (V4 header), 16-bit RGB565 bit fields
+    let alpha = image.decode_bmp(asset("photo-32.bmp")) !!
+    let alpha_ref = image.decode_png(asset("photo-32-ref.png")) !!
+    assert(alpha.channels == 4 && mem.equals(alpha.pixels, alpha_ref.pixels))
+    let rgb565 = image.decode_bmp(asset("photo-16.bmp")) !!
+    let rgb565_ref = image.decode_png(asset("photo-16-ref.png")) !!
+    assert(rgb565.channels == 3 && mem.equals(rgb565.pixels, rgb565_ref.pixels))
+
+    // Palettes at 8, 4 and 1 bit
+    let names = Array[String]{ "photo-8", "photo-4", "photo-1" }
+    each names as name {
+        let ours = image.decode_bmp(asset(name + ".bmp")) !!
+        let ref = image.decode_png(asset(name + "-ref.png")) !!.to_rgb()
+        assert(ours.channels == 3 && mem.equals(ours.pixels, ref.pixels))
+    }
+}
+
+test "BMP: unsupported and malformed files are reported" {
+    image.decode_bmp(asset("photo-rle.bmp")) ! {
+        assert(E.code == E.unsupported)
+        assert(E.message.contains("Run-length"))
+    }
+    let data = asset("photo-24.bmp")
+    image.decode_bmp(data.range(0, data.bytes - 10)) ! assert(E.code == E.invalid)
+    image.decode_bmp("BM") ! assert(E.code == E.invalid)
+    // An OS/2 header is 12 bytes
+    let os2 = "BM" + "\x00\x00\x00\x00\x00\x00\x00\x00\x1a\x00\x00\x00" + "\x0c\x00\x00\x00\x01\x00\x01\x00\x01\x00\x18\x00" + "\x00\x00\x00\x00"
+    image.decode_bmp(os2) ! assert(E.code == E.unsupported)
+}
+
+test "BMP: encoding round-trips every channel count exactly" {
+    let channels = Array[u8]{ 1, 3, 4 }
+    each channels as c {
+        let img = image.Image.new(5, 4, c) !!
+        let y: uint = 0
+        while y < 4 {
+            let x: uint = 0
+            while x < 5 {
+                let k: uint = 0
+                while k < c.to(uint) {
+                    img.set(x, y, ((x * 37 + y * 91 + k * 13) % 256).to(u8), k.to(u8))
+                    k++
+                }
+                x++
+            }
+            y++
+        }
+        let encoded = img.encode_bmp()
+        assert(image.is_bmp(encoded))
+        let back = image.decode(encoded) !!
+        assert(back.width == 5 && back.height == 4)
+        // Gray comes back as RGB from its palette
+        let expect = c == 1 ? img.to_rgb() : img
+        assert(back.channels == expect.channels)
+        assert(mem.equals(back.pixels, expect.pixels))
+    }
+}

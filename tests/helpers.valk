@@ -1,0 +1,30 @@
+use image
+
+fn asset(name: String) String {
+    let files = #embed_dir("assets")
+    return files.get(name) !? ""
+}
+
+// The largest and the average difference between two images of the same shape
+fn max_diff(a: image.Image, b: image.Image) uint {
+    assert(a.width == b.width && a.height == b.height && a.channels == b.channels)
+    let max: uint = 0
+    let i: uint = 0
+    while i < a.pixels.length {
+        let d = a.pixels[i] > b.pixels[i] ? a.pixels[i] - b.pixels[i] : b.pixels[i] - a.pixels[i]
+        if d.to(uint) > max : max = d.to(uint)
+        i++
+    }
+    return max
+}
+
+fn mean_diff(a: image.Image, b: image.Image) float {
+    let total: uint = 0
+    let i: uint = 0
+    while i < a.pixels.length {
+        let d = a.pixels[i] > b.pixels[i] ? a.pixels[i] - b.pixels[i] : b.pixels[i] - a.pixels[i]
+        total += d.to(uint)
+        i++
+    }
+    return total.to(float) / a.pixels.length.to(float)
+}

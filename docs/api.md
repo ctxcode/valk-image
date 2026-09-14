@@ -31,10 +31,18 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 ## Functions for 'main'
 
 ```js
-// Decodes an image, recognizing the format from its first bytes.
+// Decodes an image, recognizing the format from its first bytes: PNG, JPEG or BMP.
 + fn decode(data: local &[u8]) Image !ImageError
+// Decodes a Windows bitmap.
++ fn decode_bmp(data: local &[u8]) Image !ImageError
+// Decodes a baseline JPEG image.
++ fn decode_jpeg(data: local &[u8]) Image !ImageError
 // Decodes a PNG image.
 + fn decode_png(data: local &[u8]) Image !ImageError
+// Whether `data` starts like a Windows bitmap.
++ fn is_bmp(data: local &[u8]) bool
+// Whether `data` starts with the JPEG marker sequence.
++ fn is_jpeg(data: local &[u8]) bool
 // Whether `data` starts with the PNG signature.
 + fn is_png(data: local &[u8]) bool
 // Reads and decodes the image file at `path`.
@@ -61,6 +69,14 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn cover(width: uint, height: uint, filter: Filter (Filter.lanczos)) Image !ImageError
     // Returns the `width` by `height` rectangle whose top-left corner is (`x`, `y`).
     + fn crop(x: uint, y: uint, width: uint, height: uint) Image !ImageError
+    // Encodes the image as a Windows bitmap: 8-bit with a gray palette, 24-bit RGB, or 32-bit RGBA with a V4 header so readers know where the alpha is.
+    + fn encode_bmp() String
+    // Writes the image as a bitmap to `out` and returns the bytes written; see `encode_bmp`.
+    + fn encode_bmp_into(out: Writer) uint !io:IoError
+    // Encodes the image as a baseline JPEG at `quality` (1..100).
+    + fn encode_jpeg(quality: uint (85), subsample_chroma: bool (true)) String
+    // Writes the image as JPEG to `out` and returns the bytes written; see `encode_jpeg`.
+    + fn encode_jpeg_into(out: Writer, quality: uint (85), subsample_chroma: bool (true)) uint !io:IoError
     // Encodes the image as PNG: 8-bit gray, RGB or RGBA, one IDAT chunk.
     + fn encode_png(level: uint (6)) String
     // Writes the image as PNG to `out` and returns the bytes written; see `encode_png`.
@@ -101,7 +117,7 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn to_rgb() Image
     // Returns a four-channel copy; the added alpha is opaque.
     + fn to_rgba() Image
-    // Encodes the image by the extension of `path` (`.png`) and writes it there.
+    // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg` or `.bmp`) and writes it there; JPEG uses the default quality of `encode_jpeg`.
     + fn write(path: String) void !ImageError
 }
 ```

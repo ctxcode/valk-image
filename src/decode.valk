@@ -1,12 +1,12 @@
 use valk.fs
 
-/// Decodes an image, recognizing the format from its first bytes.
+/// Decodes an image, recognizing the format from its first bytes: PNG, JPEG or BMP.
 ///
-/// PNG is supported; a JPEG throws `unsupported` until its decoder lands, anything else
-/// `invalid`.
+/// Anything else throws `invalid`.
 + fn decode(data: local &[u8]) Image !ImageError {
     if is_png(data) : return decode_png(data) !>
-    if data.length >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff : throw .unsupported { message: "JPEG" }
+    if is_jpeg(data) : return decode_jpeg(data) !>
+    if is_bmp(data) : return decode_bmp(data) !>
     throw .invalid { message: "Unknown image format" }
 }
 
@@ -19,10 +19,15 @@ use valk.fs
 }
 
 extend Image {
-    /// Encodes the image by the extension of `path` (`.png`) and writes it there.
+    /// Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg` or `.bmp`)
+    /// and writes it there; JPEG uses the default quality of `encode_jpeg`.
     + fn write(path: String) !ImageError {
         let ext = fs.extension(path).lower()
-        if ext != "png" : throw .unsupported { message: "Writing ." + ext + " files" }
-        fs.write(path, this.encode_png()) ! throw .invalid { message: "Cannot write " + path }
+        let data = ""
+        if ext == "png" : data = this.encode_png()
+        else if ext == "jpg" || ext == "jpeg" : data = this.encode_jpeg()
+        else if ext == "bmp" : data = this.encode_bmp()
+        else : throw .unsupported { message: "Writing ." + ext + " files" }
+        fs.write(path, data) ! throw .invalid { message: "Cannot write " + path }
     }
 }

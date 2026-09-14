@@ -64,10 +64,10 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
 
 /// Decodes a PNG image.
 ///
-/// Reads every bit depth and color type, palettes and `tRNS` transparency; 16-bit samples
-/// are reduced to 8 bits. Gray becomes a 1-channel image, gray with alpha and palettes
-/// with transparency become RGBA, the rest RGB or RGBA as stored. Interlaced (Adam7) files
-/// throw `unsupported`; malformed files throw `invalid` with a message naming the chunk.
+/// Reads every bit depth and color type, palettes and `tRNS` transparency, plain or
+/// interlaced (Adam7); 16-bit samples are reduced to 8 bits. Gray becomes a 1-channel
+/// image, gray with alpha and palettes with transparency become RGBA, the rest RGB or RGBA
+/// as stored. Malformed files throw `invalid` with a message naming the chunk.
 + fn decode_png(data: local &[u8]) Image !ImageError {
     if !is_png(data) : throw .invalid { message: "Not a PNG file" }
     let pos: uint = 8
@@ -111,7 +111,7 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
         pos += 12 + length
     }
     if !seen_header : throw .invalid { message: "Missing IHDR chunk" }
-    if interlace != 0 : throw .unsupported { message: "Interlaced (Adam7) PNG" }
+    if interlace > 1 : throw .invalid { message: "Unknown interlace method" }
     if width == 0 || height == 0 || width > MAX_PIXELS || height > MAX_PIXELS || width * height > MAX_PIXELS {
         throw .too_large { message: "The image exceeds MAX_PIXELS" }
     }
@@ -143,26 +143,87 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
     if color_type == 3 && bit_depth == 16 : throw .invalid { message: "16-bit palette" }
 
     let bits_per_pixel = samples * bit_depth.to(uint)
-    let stride = (width * bits_per_pixel + 7) / 8
     let bytes_per_pixel = bits_per_pixel < 8 ? 1 : bits_per_pixel / 8
-    let raw_size = (stride + 1) * height
+    let image = Image.new(width, height, out_channels) !>
+
+    // Interlaced files hold seven passes of filtered rows, each a smaller picture of every
+    // n-th pixel; plain files are one pass covering everything
+    let raw_size: uint = 0
+    let passes = interlace == 1 ? 7 : 1
+    let pass: uint = 0
+    while pass < passes {
+        let pw = pass_size(width, pass, true, interlace == 1)
+        let ph = pass_size(height, pass, false, interlace == 1)
+        if pw > 0 && ph > 0 : raw_size += ((pw * bits_per_pixel + 7) / 8 + 1) * ph
+        pass++
+    }
     let raw = compress.unzlib(idat, raw_size) ! throw .invalid { message: "Corrupt image data" }
     if raw.bytes != raw_size : throw .invalid { message: "Image data has the wrong size" }
-
-    // Undo the row filters in place, each row against the one above
     let rows = [u8]{ 0 x raw_size }
     mem.copy(raw, rows)
-    unfilter_rows(rows, height, stride, bytes_per_pixel) !>
 
-    let image = Image.new(width, height, out_channels) !>
-    let y: uint = 0
-    while y < height {
-        let row = rows.view(y * (stride + 1) + 1, stride)
-        let dst = image.row(y)
-        expand_row(row, dst, width, color_type, bit_depth, out_channels, palette, trns)
-        y++
+    let offset: uint = 0
+    pass = 0
+    while pass < passes {
+        let pw = pass_size(width, pass, true, interlace == 1)
+        let ph = pass_size(height, pass, false, interlace == 1)
+        if pw == 0 || ph == 0 {
+            pass++
+            continue
+        }
+        let stride = (pw * bits_per_pixel + 7) / 8
+        let size = (stride + 1) * ph
+        // Undo the row filters in place, each row against the one above
+        unfilter_rows(rows.view(offset, size), ph, stride, bytes_per_pixel) !>
+        let expanded = interlace == 1 ? [u8]{ 0 x pw * out_channels.to(uint) } : image.row(0)
+        let y: uint = 0
+        while y < ph {
+            let row = rows.view(offset + y * (stride + 1) + 1, stride)
+            if interlace == 0 {
+                expand_row(row, image.row(y), width, color_type, bit_depth, out_channels, palette, trns)
+            } else {
+                expand_row(row, expanded, pw, color_type, bit_depth, out_channels, palette, trns)
+                scatter_pass(expanded, image, pass, y)
+            }
+            y++
+        }
+        offset += size
+        pass++
     }
     return image
+}
+
+// Adam7 pass origins and steps: x start, y start, x step, y step
+global adam7: Array[u8] (Array[u8]{ 0, 0, 8, 8, 4, 0, 8, 8, 0, 4, 4, 8, 2, 0, 4, 4, 0, 2, 2, 4, 1, 0, 2, 2, 0, 1, 1, 2 })
+
+// Pixels (columns or rows) an interlace pass holds along one axis of `length`
+fn pass_size(length: uint, pass: uint, horizontal: bool, interlaced: bool) uint {
+    if !interlaced : return length
+    let start = adam7[pass * 4 + (horizontal ? 0 : 1)].to(uint)
+    let step = adam7[pass * 4 + (horizontal ? 2 : 3)].to(uint)
+    if length <= start : return 0
+    return (length - start + step - 1) / step
+}
+
+// Copies row `y` of an interlace pass to the pixels it stands for
+fn scatter_pass(expanded: local &[u8], image: Image, pass: uint, y: uint) {
+    let x_start = adam7[pass * 4].to(uint)
+    let y_start = adam7[pass * 4 + 1].to(uint)
+    let x_step = adam7[pass * 4 + 2].to(uint)
+    let y_step = adam7[pass * 4 + 3].to(uint)
+    let c = image.channels.to(uint)
+    let dst = image.row(y_start + y * y_step)
+    let count = expanded.length / c
+    let i: uint = 0
+    while i < count {
+        let to = (x_start + i * x_step) * c
+        let k: uint = 0
+        while k < c {
+            dst[to + k] = expanded[i * c + k]
+            k++
+        }
+        i++
+    }
 }
 
 fn read_u32_be(data: local &[u8], at: uint) u32 {

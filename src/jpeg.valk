@@ -1,0 +1,1091 @@
+use valk.io
+use valk.mem
+use valk.math
+
+// Baseline JPEG (ITU T.81 sequential DCT, Huffman coded, 8-bit samples): a decoder for
+// gray and YCbCr/RGB images with any sampling factors and restart intervals, and an
+// encoder writing gray or 4:2:0 / 4:4:4 YCbCr with the standard tables of Annex K.
+
+// Natural-order index of each zigzag position
+global zigzag_order: Array[u8] (Array[u8]{
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+})
+
+// The lookup table of the fastest Huffman path resolves codes up to this many bits
+value FAST_BITS (9)
+
+/// Whether `data` starts with the JPEG marker sequence.
++ fn is_jpeg(data: local &[u8]) bool {
+    return data.length >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff
+}
+
+/// Decodes a baseline JPEG image.
+///
+/// Reads sequential Huffman-coded 8-bit files with one component (gray) or three (YCbCr,
+/// or RGB when an Adobe marker says so), any chroma sampling factors and restart
+/// intervals. Subsampled chroma is upsampled bilinearly. Progressive, arithmetic-coded,
+/// lossless, 12-bit and CMYK files throw `unsupported`; malformed files throw `invalid`.
++ fn decode_jpeg(data: local &[u8]) Image !ImageError {
+    if !is_jpeg(data) : throw .invalid { message: "Not a JPEG file" }
+    let bytes = [u8]{ 0 x data.length }
+    mem.copy(data, bytes)
+    let decoder = Decoder{ data: bytes }
+    return decoder.decode() !>
+}
+
+extend Image {
+    /// Encodes the image as a baseline JPEG at `quality` (1..100).
+    ///
+    /// Gray images are stored as one component, RGB and RGBA (alpha dropped) as YCbCr with
+    /// 4:2:0 chroma subsampling, or 4:4:4 when `subsample_chroma` is false. Panics when a
+    /// side exceeds 65535 pixels, the format's limit.
+    + fn encode_jpeg(quality: uint (85), subsample_chroma: bool (true)) String {
+        let out = ByteBuffer.new(this.pixels.length / 8 + 1024)
+        this.encode_jpeg_into(out, quality, subsample_chroma) ! panic("A ByteBuffer write cannot fail")
+        return out.into_string()
+    }
+
+    /// Writes the image as JPEG to `out` and returns the bytes written; see `encode_jpeg`.
+    + fn encode_jpeg_into(out: io.Writer, quality: uint (85), subsample_chroma: bool (true)) uint !io.IoError {
+        if this.width > 65535 || this.height > 65535 : panic("JPEG images are limited to 65535 pixels per side")
+        let encoder = Encoder.new(this, quality, subsample_chroma)
+        let buf = encoder.encode()
+        return out.write(buf) !>
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Decoder
+
+class Huffman {
+    // For codes of at most FAST_BITS bits: (length << 8) | symbol, 0 when longer
+    fast: mut &[u16] ([u16]{ 0 x 512 })
+    // Per code length 1..16: the largest code (-1 when none), the smallest, and the index
+    // of the first symbol with that length
+    maxcode: mut &[int] ([int]{ -1 x 18 })
+    mincode: mut &[int] ([int]{ 0 x 18 })
+    valptr: mut &[uint] ([uint]{ 0 x 18 })
+    values: mut &[u8] ([u8]{ 0 x 256 })
+    count: uint (0)
+
+    static fn build(counts: local &[u8], values: local &[u8]) SELF !ImageError {
+        let table = SELF{}
+        let total: uint = 0
+        let l: uint = 0
+        while l < 16 : total += counts[l++].to(uint)
+        if total > 256 || total > values.length : throw .invalid { message: "Huffman table has too many symbols" }
+        mem.copy(values.view(0, total), table.values)
+        table.count = total
+        let code: int = 0
+        let k: uint = 0
+        l = 1
+        while l <= 16 {
+            let n = counts[l - 1].to(uint)
+            table.mincode[l] = code
+            table.valptr[l] = k
+            let i: uint = 0
+            while i < n {
+                if l <= FAST_BITS {
+                    let first = (code << (FAST_BITS - l)).to(uint)
+                    let span: uint = 1 << (FAST_BITS - l)
+                    let j: uint = 0
+                    while j < span {
+                        table.fast[first + j] = ((l << 8) | values[k].to(uint)).to(u16)
+                        j++
+                    }
+                }
+                code++
+                k++
+                i++
+            }
+            table.maxcode[l] = n > 0 ? code - 1 : -1
+            if code > (1 << l) : throw .invalid { message: "Huffman table is over-subscribed" }
+            code = code << 1
+            l++
+        }
+        return table
+    }
+}
+
+class Component {
+    id: u8
+    h: uint
+    v: uint
+    // Quantization table id; the Huffman table ids come from the scan header
+    tq: u8
+    td: u8 (0)
+    ta: u8 (0)
+    pred: int (0)
+    // The decoded samples: `blocks_w` by `blocks_h` blocks (padded to whole MCUs), of
+    // which the top-left `width` by `height` samples are the picture
+    width: uint (0)
+    height: uint (0)
+    blocks_w: uint (0)
+    blocks_h: uint (0)
+    plane: mut &[u8] ([u8]{ 0 x 0 })
+
+    get stride: uint {
+        return this.blocks_w * 8
+    }
+}
+
+class Decoder {
+    data: mut &[u8]
+    pos: uint (0)
+    // Bit reader state for entropy-coded segments
+    acc: uint (0)
+    acc_bits: uint (0)
+    // Tables by id
+    quant: Array[?mut &[u16]] (.{ null, null, null, null })
+    dc_tables: Array[?Huffman] (.{ null, null, null, null })
+    ac_tables: Array[?Huffman] (.{ null, null, null, null })
+    components: Array[Component] (.{})
+    scan: Array[Component] (.{})
+    width: uint (0)
+    height: uint (0)
+    hmax: uint (1)
+    vmax: uint (1)
+    mcus_x: uint (0)
+    mcus_y: uint (0)
+    restart_interval: uint (0)
+    adobe_transform: int (-1)
+    seen_frame: bool (false)
+    coef: mut &[int] ([int]{ 0 x 64 })
+    tmp: mut &[int] ([int]{ 0 x 64 })
+
+    fn decode() Image !ImageError {
+        this.pos = 2
+        let seen_scan = false
+        while true {
+            let marker = this.next_marker() !>
+            if marker == 0xd9 : break
+            // Standalone markers carry no segment
+            if marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7) : continue
+            if this.pos + 2 > this.data.length : throw .invalid { message: "Truncated segment" }
+            let length = ((this.data[this.pos].to(uint) << 8) | this.data[this.pos + 1].to(uint))
+            if length < 2 || this.pos + length > this.data.length : throw .invalid { message: "Truncated segment" }
+            let segment = this.data.view(this.pos + 2, length - 2)
+            this.pos += length
+            if marker == 0xc0 || marker == 0xc1 {
+                this.parse_frame(segment) !>
+            } else if marker == 0xc2 || marker == 0xc6 || marker == 0xca || marker == 0xce {
+                throw .unsupported { message: "Progressive JPEG" }
+            } else if marker == 0xc3 || marker == 0xc7 || marker == 0xcb || marker == 0xcf {
+                throw .unsupported { message: "Lossless JPEG" }
+            } else if marker == 0xc9 || marker == 0xcd || marker == 0xc5 {
+                throw .unsupported { message: "Arithmetic-coded or hierarchical JPEG" }
+            } else if marker == 0xc4 {
+                this.parse_huffman_tables(segment) !>
+            } else if marker == 0xdb {
+                this.parse_quant_tables(segment) !>
+            } else if marker == 0xdd {
+                if segment.length < 2 : throw .invalid { message: "Bad DRI segment" }
+                this.restart_interval = (segment[0].to(uint) << 8) | segment[1].to(uint)
+            } else if marker == 0xda {
+                if !this.seen_frame : throw .invalid { message: "Scan before the frame header" }
+                this.parse_scan(segment) !>
+                this.decode_scan() !>
+                seen_scan = true
+            } else if marker == 0xee {
+                if segment.length >= 12 && mem.equals(segment.view(0, 5), "Adobe") : this.adobe_transform = segment[11].to(int)
+            }
+            // APPn, COM, DNL and the rest are skipped
+        }
+        if !this.seen_frame : throw .invalid { message: "Missing frame header" }
+        if !seen_scan : throw .invalid { message: "Missing scan" }
+        return this.build_image() !>
+    }
+
+    // Advances to the next marker and returns its code
+    fn next_marker() u8 !ImageError {
+        let data = this.data
+        while this.pos < data.length && data[this.pos] != 0xff : this.pos++
+        while this.pos < data.length && data[this.pos] == 0xff : this.pos++
+        if this.pos >= data.length : throw .invalid { message: "Missing end of image" }
+        let marker = data[this.pos]
+        this.pos++
+        if marker == 0 : return this.next_marker() !>
+        return marker
+    }
+
+    fn parse_frame(segment: local &[u8]) !ImageError {
+        if this.seen_frame : throw .invalid { message: "Multiple frame headers" }
+        if segment.length < 6 : throw .invalid { message: "Bad frame header" }
+        if segment[0] != 8 : throw .unsupported { message: segment[0].to(uint).to(String) + "-bit samples" }
+        this.height = (segment[1].to(uint) << 8) | segment[2].to(uint)
+        this.width = (segment[3].to(uint) << 8) | segment[4].to(uint)
+        let count = segment[5].to(uint)
+        if this.height == 0 : throw .unsupported { message: "Height defined by a DNL marker" }
+        if this.width == 0 || this.width * this.height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+        if count == 4 : throw .unsupported { message: "CMYK JPEG" }
+        if count != 1 && count != 3 : throw .unsupported { message: count.to(String) + "-component JPEG" }
+        if segment.length < 6 + count * 3 : throw .invalid { message: "Bad frame header" }
+        let i: uint = 0
+        while i < count {
+            let at = 6 + i * 3
+            let h = (segment[at + 1] >> 4).to(uint)
+            let v = (segment[at + 1] & 15).to(uint)
+            if h == 0 || h > 4 || v == 0 || v > 4 : throw .invalid { message: "Bad sampling factors" }
+            if segment[at + 2] > 3 : throw .invalid { message: "Bad quantization table id" }
+            this.components.append(Component{ id: segment[at], h: h, v: v, tq: segment[at + 2] })
+            if h > this.hmax : this.hmax = h
+            if v > this.vmax : this.vmax = v
+            i++
+        }
+        if count == 1 {
+            // A single component is never subsampled, whatever the header says
+            this.hmax = 1
+            this.vmax = 1
+            this.components[0].h = 1
+            this.components[0].v = 1
+        }
+        this.mcus_x = (this.width + this.hmax * 8 - 1) / (this.hmax * 8)
+        this.mcus_y = (this.height + this.vmax * 8 - 1) / (this.vmax * 8)
+        each this.components as comp {
+            comp.width = (this.width * comp.h + this.hmax - 1) / this.hmax
+            comp.height = (this.height * comp.v + this.vmax - 1) / this.vmax
+            comp.blocks_w = this.mcus_x * comp.h
+            comp.blocks_h = this.mcus_y * comp.v
+            comp.plane = [u8]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
+        }
+        this.seen_frame = true
+    }
+
+    fn parse_huffman_tables(segment: local &[u8]) !ImageError {
+        let pos: uint = 0
+        while pos < segment.length {
+            if pos + 17 > segment.length : throw .invalid { message: "Bad Huffman table" }
+            let class = segment[pos] >> 4
+            let id = (segment[pos] & 15).to(uint)
+            if class > 1 || id > 3 : throw .invalid { message: "Bad Huffman table id" }
+            let counts = segment.view(pos + 1, 16)
+            let total: uint = 0
+            let i: uint = 0
+            while i < 16 : total += counts[i++].to(uint)
+            if pos + 17 + total > segment.length : throw .invalid { message: "Bad Huffman table" }
+            let table = Huffman.build(counts, segment.view(pos + 17, total)) !>
+            if class == 0 : this.dc_tables[id] = table
+            else : this.ac_tables[id] = table
+            pos += 17 + total
+        }
+    }
+
+    fn parse_quant_tables(segment: local &[u8]) !ImageError {
+        let pos: uint = 0
+        while pos < segment.length {
+            let precision = segment[pos] >> 4
+            let id = (segment[pos] & 15).to(uint)
+            if id > 3 : throw .invalid { message: "Bad quantization table id" }
+            let size: uint = precision == 0 ? 64 : 128
+            if pos + 1 + size > segment.length : throw .invalid { message: "Bad quantization table" }
+            let table = [u16]{ 0 x 64 }
+            let i: uint = 0
+            while i < 64 {
+                if precision == 0 : table[i] = segment[pos + 1 + i].to(u16)
+                else : table[i] = ((segment[pos + 1 + i * 2].to(uint) << 8) | segment[pos + 2 + i * 2].to(uint)).to(u16)
+                i++
+            }
+            this.quant[id] = table
+            pos += 1 + size
+        }
+    }
+
+    fn parse_scan(segment: local &[u8]) !ImageError {
+        if segment.length < 1 : throw .invalid { message: "Bad scan header" }
+        let count = segment[0].to(uint)
+        if count == 0 || count > this.components.length || segment.length < 4 + count * 2 : throw .invalid { message: "Bad scan header" }
+        this.scan = Array[Component]{}
+        let i: uint = 0
+        while i < count {
+            let id = segment[1 + i * 2]
+            let tables = segment[2 + i * 2]
+            let found: ?Component = null
+            each this.components as comp : if comp.id == id : found = comp
+            if !isset(found) : throw .invalid { message: "Scan names an unknown component" }
+            let comp = found
+            comp.td = tables >> 4
+            comp.ta = tables & 15
+            if comp.td > 3 || comp.ta > 3 : throw .invalid { message: "Bad Huffman table id in scan" }
+            if !isset(this.dc_tables[comp.td.to(uint)]) || !isset(this.ac_tables[comp.ta.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
+            if !isset(this.quant[comp.tq.to(uint)]) : throw .invalid { message: "Scan uses a missing quantization table" }
+            comp.pred = 0
+            this.scan.append(comp)
+            i++
+        }
+        let ss = segment[1 + count * 2]
+        let se = segment[2 + count * 2]
+        if ss != 0 || se != 63 : throw .unsupported { message: "Progressive JPEG" }
+    }
+
+    fn decode_scan() !ImageError {
+        this.acc = 0
+        this.acc_bits = 0
+        let mcu_count: uint = 0
+        if this.scan.length == 1 {
+            // A single-component scan walks the component's own blocks, not padded MCUs
+            let comp = this.scan[0]
+            let bw = (comp.width + 7) / 8
+            let bh = (comp.height + 7) / 8
+            let by: uint = 0
+            while by < bh {
+                let bx: uint = 0
+                while bx < bw {
+                    this.decode_block(comp, bx, by) !>
+                    mcu_count++
+                    if this.restart_interval > 0 && mcu_count % this.restart_interval == 0 && (by < bh - 1 || bx < bw - 1) : this.restart() !>
+                    bx++
+                }
+                by++
+            }
+        } else {
+            let total = this.mcus_x * this.mcus_y
+            let my: uint = 0
+            while my < this.mcus_y {
+                let mx: uint = 0
+                while mx < this.mcus_x {
+                    each this.scan as comp {
+                        let v: uint = 0
+                        while v < comp.v {
+                            let h: uint = 0
+                            while h < comp.h {
+                                this.decode_block(comp, mx * comp.h + h, my * comp.v + v) !>
+                                h++
+                            }
+                            v++
+                        }
+                    }
+                    mcu_count++
+                    if this.restart_interval > 0 && mcu_count % this.restart_interval == 0 && mcu_count < total : this.restart() !>
+                    mx++
+                }
+                my++
+            }
+        }
+        // Leave the position at the marker that ended the entropy-coded segment
+        this.acc = 0
+        this.acc_bits = 0
+    }
+
+    // Expects an RSTn marker: drops the buffered bits and resets the DC predictors
+    fn restart() !ImageError {
+        this.acc = 0
+        this.acc_bits = 0
+        let data = this.data
+        while this.pos < data.length && data[this.pos] != 0xff : this.pos++
+        while this.pos + 1 < data.length && data[this.pos] == 0xff && data[this.pos + 1] == 0xff : this.pos++
+        if this.pos + 1 >= data.length || data[this.pos + 1] < 0xd0 || data[this.pos + 1] > 0xd7 : throw .invalid { message: "Missing restart marker" }
+        this.pos += 2
+        each this.scan as comp : comp.pred = 0
+    }
+
+    // Tops the accumulator up to at least 57 bits; past a marker it reads zeros
+    fn fill() {
+        let data = this.data
+        while this.acc_bits <= 56 {
+            let byte: uint = 0
+            if this.pos < data.length {
+                byte = data[this.pos].to(uint)
+                if byte == 0xff {
+                    if this.pos + 1 < data.length && data[this.pos + 1] == 0 : this.pos += 2
+                    else : byte = 0
+                } else {
+                    this.pos++
+                }
+            }
+            this.acc = (this.acc << 8) | byte
+            this.acc_bits += 8
+        }
+    }
+
+    fn read_bits(count: uint) uint {
+        if count == 0 : return 0
+        if this.acc_bits < count : this.fill()
+        this.acc_bits -= count
+        return (this.acc >> this.acc_bits) & ((1 << count) - 1)
+    }
+
+    fn decode_symbol(table: Huffman) u8 !ImageError {
+        if this.acc_bits < 16 : this.fill()
+        let peek = (this.acc >> (this.acc_bits - FAST_BITS)) & 511
+        let entry = table.fast[peek].to(uint)
+        if entry != 0 {
+            this.acc_bits -= entry >> 8
+            return (entry & 255).to(u8)
+        }
+        let code: int = 0
+        let l: uint = 1
+        while l <= 16 {
+            code = (code << 1) | this.read_bits(1).to(int)
+            if code <= table.maxcode[l] {
+                let index = table.valptr[l] + (code - table.mincode[l]).to(uint)
+                if index >= table.count : throw .invalid { message: "Bad Huffman code" }
+                return table.values[index]
+            }
+            l++
+        }
+        throw .invalid { message: "Bad Huffman code" }
+    }
+
+    // Reads a `size`-bit magnitude category value as a signed coefficient
+    fn receive_extend(size: uint) int {
+        if size == 0 : return 0
+        let value = this.read_bits(size).to(int)
+        if value < (1 << (size - 1)) : value += ((-1) << size) + 1
+        return value
+    }
+
+    fn decode_block(comp: Component, bx: uint, by: uint) !ImageError {
+        let dc_table = this.dc_tables[comp.td.to(uint)]
+        let ac_table = this.ac_tables[comp.ta.to(uint)]
+        let quant = this.quant[comp.tq.to(uint)]
+        if !isset(dc_table) || !isset(ac_table) || !isset(quant) : throw .invalid { message: "Missing table" }
+        let coef = this.coef
+        let i: uint = 0
+        while i < 64 : coef[i++] = 0
+        let category = this.decode_symbol(dc_table) !>
+        if category > 11 : throw .invalid { message: "Bad DC coefficient" }
+        comp.pred += this.receive_extend(category.to(uint))
+        coef[0] = comp.pred * quant[0].to(int)
+        let k: uint = 1
+        while k < 64 {
+            let symbol = this.decode_symbol(ac_table) !>
+            let run = (symbol >> 4).to(uint)
+            let size = (symbol & 15).to(uint)
+            if size == 0 {
+                if run != 15 : break
+                k += 16
+                continue
+            }
+            k += run
+            if k > 63 : throw .invalid { message: "Coefficients overflow the block" }
+            coef[zigzag_order[k].to(uint)] = this.receive_extend(size) * quant[k].to(int)
+            k++
+        }
+        if bx >= comp.blocks_w || by >= comp.blocks_h : throw .invalid { message: "Block outside the component" }
+        idct_block(coef, this.tmp, comp.plane, (by * 8) * comp.stride + bx * 8, comp.stride)
+    }
+
+    fn build_image() Image !ImageError {
+        let count = this.components.length
+        let image = Image.new(this.width, this.height, count == 1 ? 1 : 3) !>
+        if count == 1 {
+            let comp = this.components[0]
+            let y: uint = 0
+            while y < this.height {
+                mem.copy(comp.plane.view(y * comp.stride, this.width), image.row(y))
+                y++
+            }
+            return image
+        }
+        let planes = Array[mut &[u8]]{}
+        each this.components as comp : planes.append(this.upsample(comp))
+        let c0 = planes[0]
+        let c1 = planes[1]
+        let c2 = planes[2]
+        let rgb = this.adobe_transform == 0 || (this.components[0].id == 'R' && this.components[1].id == 'G' && this.components[2].id == 'B' && this.adobe_transform < 0)
+        let pixels = image.pixels
+        let total = this.width * this.height
+        let i: uint = 0
+        while i < total {
+            let at = i * 3
+            if rgb {
+                pixels[at] = c0[i]
+                pixels[at + 1] = c1[i]
+                pixels[at + 2] = c2[i]
+            } else {
+                let y = c0[i].to(int) << 16
+                let cb = c1[i].to(int) - 128
+                let cr = c2[i].to(int) - 128
+                pixels[at] = clamp_shift16(y + 91881 * cr)
+                pixels[at + 1] = clamp_shift16(y - 22554 * cb - 46802 * cr)
+                pixels[at + 2] = clamp_shift16(y + 116130 * cb)
+            }
+            i++
+        }
+        return image
+    }
+
+    // Returns the component at full resolution, `width * height` samples
+    fn upsample(comp: Component) mut &[u8] {
+        let width = this.width
+        let height = this.height
+        let out = [u8]{ 0 x width * height }
+        if comp.h == this.hmax && comp.v == this.vmax {
+            let y: uint = 0
+            while y < height {
+                mem.copy(comp.plane.view(y * comp.stride, width), out.view(y * width, width))
+                y++
+            }
+            return out
+        }
+        // Bilinear: each output sample sits between the two nearest source samples per
+        // axis, positions in 1/256ths, clamped at the picture edges
+        let xs = sample_positions(width, comp.width, comp.h, this.hmax)
+        let ys = sample_positions(height, comp.height, comp.v, this.vmax)
+        let stride = comp.stride
+        let plane = comp.plane
+        let y: uint = 0
+        while y < height {
+            let y0 = ys[y * 2]
+            let fy = ys[y * 2 + 1]
+            let y1 = y0 + 1 < comp.height ? y0 + 1 : y0
+            let row0 = y0 * stride
+            let row1 = y1 * stride
+            let x: uint = 0
+            while x < width {
+                let x0 = xs[x * 2]
+                let fx = xs[x * 2 + 1]
+                let x1 = x0 + 1 < comp.width ? x0 + 1 : x0
+                let top = plane[row0 + x0].to(uint) * (256 - fx) + plane[row0 + x1].to(uint) * fx
+                let bottom = plane[row1 + x0].to(uint) * (256 - fx) + plane[row1 + x1].to(uint) * fx
+                out[y * width + x] = ((top * (256 - fy) + bottom * fy + 32768) >> 16).to(u8)
+                x++
+            }
+            y++
+        }
+        return out
+    }
+}
+
+// For each of `to` output positions: the source index and the 1/256ths past it, the
+// source being `from` samples at `num / den` of the output resolution
+fn sample_positions(to: uint, from: uint, num: uint, den: uint) mut &[uint] {
+    let out = [uint]{ 0 x to * 2 }
+    let i: uint = 0
+    while i < to {
+        // ((i + 0.5) * num / den - 0.5) * 256
+        let pos: int = (((i * 2 + 1) * num * 128) / den).to(int) - 128
+        if pos < 0 : pos = 0
+        let index = (pos >> 8).to(uint)
+        if index >= from {
+            out[i * 2] = from - 1
+            out[i * 2 + 1] = 0
+        } else {
+            out[i * 2] = index
+            out[i * 2 + 1] = (pos & 255).to(uint)
+        }
+        i++
+    }
+    return out
+}
+
+fn clamp_shift16(value: int) u8 {
+    let v = (value + 32768) >> 16
+    if v < 0 : return 0
+    if v > 255 : return 255
+    return v.to(u8)
+}
+
+fn clamp_pixel(value: int) u8 {
+    if value < 0 : return 0
+    if value > 255 : return 255
+    return value.to(u8)
+}
+
+// Fixed-point constants of the AAN-style integer IDCT (scaled by 4096)
+value F_0_541 (2217)
+value F_1_847 (7568)
+value F_0_765 (3135)
+value F_1_175 (4816)
+value F_0_298 (1223)
+value F_2_053 (8410)
+value F_3_072 (12586)
+value F_1_501 (6149)
+value F_0_899 (3686)
+value F_2_562 (10498)
+value F_1_961 (8034)
+value F_0_390 (1598)
+
+// Inverse DCT of the 64 dequantized coefficients in `coef` (natural order) into 8x8
+// samples at `out[offset]` with rows `stride` apart; `tmp` holds the column pass.
+fn idct_block(coef: local &[int], tmp: local mut &[int], out: local mut &[u8], offset: uint, stride: uint) {
+    let i: uint = 0
+    while i < 8 {
+        if coef[i + 8] == 0 && coef[i + 16] == 0 && coef[i + 24] == 0 && coef[i + 32] == 0 && coef[i + 40] == 0 && coef[i + 48] == 0 && coef[i + 56] == 0 {
+            let dc = coef[i] * 4
+            tmp[i] = dc
+            tmp[i + 8] = dc
+            tmp[i + 16] = dc
+            tmp[i + 24] = dc
+            tmp[i + 32] = dc
+            tmp[i + 40] = dc
+            tmp[i + 48] = dc
+            tmp[i + 56] = dc
+        } else {
+            idct_1d(coef[i], coef[i + 8], coef[i + 16], coef[i + 24], coef[i + 32], coef[i + 40], coef[i + 48], coef[i + 56], tmp, i, 8, 512, 10, false, out, 0)
+        }
+        i++
+    }
+    i = 0
+    while i < 8 {
+        let base = i * 8
+        idct_1d(tmp[base], tmp[base + 1], tmp[base + 2], tmp[base + 3], tmp[base + 4], tmp[base + 5], tmp[base + 6], tmp[base + 7], tmp, 0, 0, 65536 + (128 << 17), 17, true, out, offset + i * stride)
+        i++
+    }
+}
+
+// One 8-point IDCT; results go to `tmp[at + n * step]`, or clamped to `out[at_out + n]`
+fn idct_1d(s0: int, s1: int, s2: int, s3: int, s4: int, s5: int, s6: int, s7: int, tmp: local mut &[int], at: uint, step: uint, bias: int, shift: uint, to_out: bool, out: local mut &[u8], at_out: uint) {
+    let p2 = s2
+    let p3 = s6
+    let p1 = (p2 + p3) * F_0_541
+    let t2 = p1 - p3 * F_1_847
+    let t3 = p1 + p2 * F_0_765
+    p2 = s0
+    p3 = s4
+    let t0 = (p2 + p3) * 4096
+    let t1 = (p2 - p3) * 4096
+    let x0 = t0 + t3 + bias
+    let x3 = t0 - t3 + bias
+    let x1 = t1 + t2 + bias
+    let x2 = t1 - t2 + bias
+    t0 = s7
+    t1 = s5
+    t2 = s3
+    t3 = s1
+    p3 = t0 + t2
+    let p4 = t1 + t3
+    p1 = t0 + t3
+    p2 = t1 + t2
+    let p5 = (p3 + p4) * F_1_175
+    t0 = t0 * F_0_298
+    t1 = t1 * F_2_053
+    t2 = t2 * F_3_072
+    t3 = t3 * F_1_501
+    p1 = p5 - p1 * F_0_899
+    p2 = p5 - p2 * F_2_562
+    p3 = 0 - p3 * F_1_961
+    p4 = 0 - p4 * F_0_390
+    t3 += p1 + p4
+    t2 += p2 + p3
+    t1 += p2 + p4
+    t0 += p1 + p3
+    if to_out {
+        out[at_out] = clamp_pixel((x0 + t3) >> shift)
+        out[at_out + 7] = clamp_pixel((x0 - t3) >> shift)
+        out[at_out + 1] = clamp_pixel((x1 + t2) >> shift)
+        out[at_out + 6] = clamp_pixel((x1 - t2) >> shift)
+        out[at_out + 2] = clamp_pixel((x2 + t1) >> shift)
+        out[at_out + 5] = clamp_pixel((x2 - t1) >> shift)
+        out[at_out + 3] = clamp_pixel((x3 + t0) >> shift)
+        out[at_out + 4] = clamp_pixel((x3 - t0) >> shift)
+    } else {
+        tmp[at] = (x0 + t3) >> shift
+        tmp[at + step * 7] = (x0 - t3) >> shift
+        tmp[at + step] = (x1 + t2) >> shift
+        tmp[at + step * 6] = (x1 - t2) >> shift
+        tmp[at + step * 2] = (x2 + t1) >> shift
+        tmp[at + step * 5] = (x2 - t1) >> shift
+        tmp[at + step * 3] = (x3 + t0) >> shift
+        tmp[at + step * 4] = (x3 - t0) >> shift
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Encoder
+
+global luma_quant: Array[u8] (Array[u8]{
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99,
+})
+
+global chroma_quant: Array[u8] (Array[u8]{
+    17, 18, 24, 47, 99, 99, 99, 99,
+    18, 21, 26, 66, 99, 99, 99, 99,
+    24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+})
+
+global dc_luma_counts: Array[u8] (Array[u8]{ 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0 })
+global dc_chroma_counts: Array[u8] (Array[u8]{ 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0 })
+global dc_values: Array[u8] (Array[u8]{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 })
+global ac_luma_counts: Array[u8] (Array[u8]{ 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d })
+global ac_luma_values: Array[u8] (Array[u8]{
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+})
+global ac_chroma_counts: Array[u8] (Array[u8]{ 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77 })
+global ac_chroma_values: Array[u8] (Array[u8]{
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
+    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+})
+
+// A Huffman table as the encoder uses it: code and length per symbol
+class EncodeTable {
+    codes: mut &[u16] ([u16]{ 0 x 256 })
+    sizes: mut &[u8] ([u8]{ 0 x 256 })
+
+    static fn build(counts: local &[u8], values: local &[u8]) SELF {
+        let table = SELF{}
+        let code: uint = 0
+        let k: uint = 0
+        let l: uint = 1
+        while l <= 16 {
+            let n = counts[l - 1].to(uint)
+            let i: uint = 0
+            while i < n {
+                let symbol = values[k].to(uint)
+                table.codes[symbol] = code.to(u16)
+                table.sizes[symbol] = l.to(u8)
+                code++
+                k++
+                i++
+            }
+            code = code << 1
+            l++
+        }
+        return table
+    }
+}
+
+// A plane of samples padded to whole MCUs
+class Plane {
+    width: uint
+    height: uint
+    samples: mut &[u8]
+    pred: int (0)
+
+    static fn new(width: uint, height: uint) SELF {
+        return SELF{ width: width, height: height, samples: [u8]{ 0 x width * height } }
+    }
+}
+
+class Encoder {
+    image: Image
+    out: ByteBuffer
+    quality: uint
+    subsample: bool
+    luma_quant: mut &[u16] ([u16]{ 0 x 64 })
+    chroma_quant: mut &[u16] ([u16]{ 0 x 64 })
+    dc_luma: EncodeTable
+    ac_luma: EncodeTable
+    dc_chroma: EncodeTable
+    ac_chroma: EncodeTable
+    // Bit writer
+    acc: uint (0)
+    acc_bits: uint (0)
+    // Scratch for one block
+    block: mut &[float] ([float]{ 0.0 x 64 })
+    tmp: mut &[float] ([float]{ 0.0 x 64 })
+    coef: mut &[int] ([int]{ 0 x 64 })
+    cosines: mut &[float] ([float]{ 0.0 x 64 })
+
+    static fn new(image: Image, quality: uint, subsample: bool) SELF {
+        let q = quality < 1 ? 1 : (quality > 100 ? 100 : quality)
+        let encoder = SELF{
+            image: image,
+            out: ByteBuffer.new(image.pixels.length / 8 + 1024),
+            quality: q,
+            subsample: subsample && image.channels != 1,
+            dc_luma: EncodeTable.build(dc_luma_counts.view(), dc_values.view()),
+            ac_luma: EncodeTable.build(ac_luma_counts.view(), ac_luma_values.view()),
+            dc_chroma: EncodeTable.build(dc_chroma_counts.view(), dc_values.view()),
+            ac_chroma: EncodeTable.build(ac_chroma_counts.view(), ac_chroma_values.view()),
+        }
+        // The libjpeg quality scale
+        let scale: uint = q < 50 ? 5000 / q : 200 - q * 2
+        let i: uint = 0
+        while i < 64 {
+            encoder.luma_quant[i] = scaled_quant(luma_quant[i], scale)
+            encoder.chroma_quant[i] = scaled_quant(chroma_quant[i], scale)
+            i++
+        }
+        // cosines[u * 8 + x] = C(u) / 2 * cos((2x + 1) u pi / 16), so the separable sum
+        // gives 1/4 C(u) C(v) sum sum f(x, y) cos() cos()
+        let u: uint = 0
+        while u < 8 {
+            let x: uint = 0
+            while x < 8 {
+                let c = u == 0 ? 0.7071067811865476 : 1.0
+                encoder.cosines[u * 8 + x] = c * 0.5 * math.cos((2.0 * x.to(float) + 1.0) * u.to(float) * PI / 16.0)
+                x++
+            }
+            u++
+        }
+        return encoder
+    }
+
+    fn encode() ByteBuffer {
+        let image = this.image
+        let gray = image.channels == 1
+        let mcu_w: uint = this.subsample ? 16 : 8
+        let mcu_h: uint = this.subsample ? 16 : 8
+        let mcus_x = (image.width + mcu_w - 1) / mcu_w
+        let mcus_y = (image.height + mcu_h - 1) / mcu_h
+        let planes = this.split_planes(mcus_x * mcu_w, mcus_y * mcu_h)
+
+        let out = this.out
+        out.write("\xff\xd8")
+        // JFIF APP0
+        out.write("\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")
+        // Quantization tables, in zigzag order
+        out.write("\xff\xdb")
+        out.write_u16_be(gray ? 67 : 132)
+        out.write_byte(0)
+        this.write_quant(this.luma_quant)
+        if !gray {
+            out.write_byte(1)
+            this.write_quant(this.chroma_quant)
+        }
+        // Frame header
+        let count: uint = gray ? 1 : 3
+        out.write("\xff\xc0")
+        out.write_u16_be((8 + 3 * count).to(u16))
+        out.write_byte(8)
+        out.write_u16_be(image.height.to(u16))
+        out.write_u16_be(image.width.to(u16))
+        out.write_byte(count.to(u8))
+        out.write_byte(1)
+        out.write_byte(this.subsample ? 0x22 : 0x11)
+        out.write_byte(0)
+        if !gray {
+            out.write("\x02\x11\x01\x03\x11\x01")
+        }
+        // Huffman tables
+        this.write_huffman(0x00, dc_luma_counts.view(), dc_values.view())
+        this.write_huffman(0x10, ac_luma_counts.view(), ac_luma_values.view())
+        if !gray {
+            this.write_huffman(0x01, dc_chroma_counts.view(), dc_values.view())
+            this.write_huffman(0x11, ac_chroma_counts.view(), ac_chroma_values.view())
+        }
+        // Scan header
+        out.write("\xff\xda")
+        out.write_u16_be((6 + 2 * count).to(u16))
+        out.write_byte(count.to(u8))
+        out.write("\x01\x00")
+        if !gray : out.write("\x02\x11\x03\x11")
+        out.write("\x00\x3f\x00")
+
+        let my: uint = 0
+        while my < mcus_y {
+            let mx: uint = 0
+            while mx < mcus_x {
+                let luma = planes[0]
+                if this.subsample {
+                    this.encode_block(luma, mx * 16, my * 16, this.luma_quant, this.dc_luma, this.ac_luma)
+                    this.encode_block(luma, mx * 16 + 8, my * 16, this.luma_quant, this.dc_luma, this.ac_luma)
+                    this.encode_block(luma, mx * 16, my * 16 + 8, this.luma_quant, this.dc_luma, this.ac_luma)
+                    this.encode_block(luma, mx * 16 + 8, my * 16 + 8, this.luma_quant, this.dc_luma, this.ac_luma)
+                } else {
+                    this.encode_block(luma, mx * 8, my * 8, this.luma_quant, this.dc_luma, this.ac_luma)
+                }
+                if !gray {
+                    this.encode_block(planes[1], mx * 8, my * 8, this.chroma_quant, this.dc_chroma, this.ac_chroma)
+                    this.encode_block(planes[2], mx * 8, my * 8, this.chroma_quant, this.dc_chroma, this.ac_chroma)
+                }
+                mx++
+            }
+            my++
+        }
+        // Pad the last byte with ones
+        if this.acc_bits > 0 : this.write_bits(0x7f, 7)
+        out.write("\xff\xd9")
+        return out
+    }
+
+    // Converts the picture to Y, Cb, Cr planes of `width` by `height` (whole MCUs, the
+    // edges repeated); chroma planes are half size when subsampling
+    fn split_planes(width: uint, height: uint) Array[Plane] {
+        let image = this.image
+        let c = image.channels.to(uint)
+        let luma = Plane.new(width, height)
+        let planes = Array[Plane]{ luma }
+        let gray = c == 1
+        let cw = this.subsample ? width / 2 : width
+        let ch = this.subsample ? height / 2 : height
+        let cb = Plane.new(gray ? 1 : cw, gray ? 1 : ch)
+        let cr = Plane.new(gray ? 1 : cw, gray ? 1 : ch)
+        if !gray {
+            planes.append(cb)
+            planes.append(cr)
+        }
+        // Full-resolution chroma, then averaged 2x2 when subsampling
+        let full_cb = this.subsample ? [u8]{ 0 x width * height } : cb.samples
+        let full_cr = this.subsample ? [u8]{ 0 x width * height } : cr.samples
+        let y: uint = 0
+        while y < height {
+            let sy = y < image.height ? y : image.height - 1
+            let x: uint = 0
+            while x < width {
+                let sx = x < image.width ? x : image.width - 1
+                let at = image.offset(sx, sy)
+                let to = y * width + x
+                if gray {
+                    luma.samples[to] = image.pixels[at]
+                } else {
+                    let r = image.pixels[at].to(int)
+                    let g = image.pixels[at + 1].to(int)
+                    let b = image.pixels[at + 2].to(int)
+                    // JFIF: Y = 0.299 R + 0.587 G + 0.114 B, Cb/Cr offset by 128
+                    luma.samples[to] = clamp_shift16(19595 * r + 38470 * g + 7471 * b)
+                    full_cb[to] = clamp_shift16((0 - 11059) * r - 21709 * g + 32768 * b + (128 << 16))
+                    full_cr[to] = clamp_shift16(32768 * r - 27439 * g - 5329 * b + (128 << 16))
+                }
+                x++
+            }
+            y++
+        }
+        if this.subsample && !gray {
+            let cy: uint = 0
+            while cy < ch {
+                let cx: uint = 0
+                while cx < cw {
+                    let a = (cy * 2) * width + cx * 2
+                    let b = a + width
+                    let to = cy * cw + cx
+                    cb.samples[to] = ((full_cb[a].to(uint) + full_cb[a + 1].to(uint) + full_cb[b].to(uint) + full_cb[b + 1].to(uint) + 2) / 4).to(u8)
+                    cr.samples[to] = ((full_cr[a].to(uint) + full_cr[a + 1].to(uint) + full_cr[b].to(uint) + full_cr[b + 1].to(uint) + 2) / 4).to(u8)
+                    cx++
+                }
+                cy++
+            }
+        }
+        return planes
+    }
+
+    fn write_quant(table: local &[u16]) {
+        let i: uint = 0
+        while i < 64 {
+            this.out.write_byte(table[zigzag_order[i].to(uint)].to(u8))
+            i++
+        }
+    }
+
+    fn write_huffman(id: u8, counts: local &[u8], values: local &[u8]) {
+        this.out.write("\xff\xc4")
+        this.out.write_u16_be((3 + 16 + values.length).to(u16))
+        this.out.write_byte(id)
+        this.out.write(counts)
+        this.out.write(values)
+    }
+
+    fn write_bits(bits: uint, count: uint) {
+        this.acc = (this.acc << count) | (bits & ((1 << count) - 1))
+        this.acc_bits += count
+        while this.acc_bits >= 8 {
+            let byte = ((this.acc >> (this.acc_bits - 8)) & 255).to(u8)
+            this.out.write_byte(byte)
+            if byte == 0xff : this.out.write_byte(0)
+            this.acc_bits -= 8
+        }
+    }
+
+    fn write_code(table: EncodeTable, symbol: uint) {
+        this.write_bits(table.codes[symbol].to(uint), table.sizes[symbol].to(uint))
+    }
+
+    // Writes a coefficient's magnitude category and its bits
+    fn write_value(table: EncodeTable, run: uint, value: int) {
+        let magnitude = value < 0 ? 0 - value : value
+        let size: uint = 0
+        while magnitude >> size != 0 : size++
+        this.write_code(table, (run << 4) | size)
+        if size > 0 : this.write_bits((value < 0 ? value - 1 : value).to(uint), size)
+    }
+
+    fn encode_block(plane: Plane, x0: uint, y0: uint, quant: local &[u16], dc: EncodeTable, ac: EncodeTable) {
+        let block = this.block
+        let tmp = this.tmp
+        let cosines = this.cosines
+        let coef = this.coef
+        let samples = plane.samples
+        let stride = plane.width
+        // Rows: tmp[y * 8 + u] = sum over x of (f - 128) * cosines[u][x]
+        let y: uint = 0
+        while y < 8 {
+            let row = (y0 + y) * stride + x0
+            let x: uint = 0
+            while x < 8 {
+                block[y * 8 + x] = samples[row + x].to(float) - 128.0
+                x++
+            }
+            let u: uint = 0
+            while u < 8 {
+                let sum = 0.0
+                x = 0
+                while x < 8 {
+                    sum += block[y * 8 + x] * cosines[u * 8 + x]
+                    x++
+                }
+                tmp[y * 8 + u] = sum
+                u++
+            }
+            y++
+        }
+        // Columns, quantized into natural order
+        let v: uint = 0
+        while v < 8 {
+            let u: uint = 0
+            while u < 8 {
+                let sum = 0.0
+                y = 0
+                while y < 8 {
+                    sum += tmp[y * 8 + u] * cosines[v * 8 + y]
+                    y++
+                }
+                let at = v * 8 + u
+                coef[at] = math.round(sum / quant[at].to(float)).to(int)
+                u++
+            }
+            v++
+        }
+        // DC as a difference, AC as (run, size) pairs in zigzag order
+        this.write_value(dc, 0, coef[0] - plane.pred)
+        plane.pred = coef[0]
+        let run: uint = 0
+        let k: uint = 1
+        while k < 64 {
+            let value = coef[zigzag_order[k].to(uint)]
+            if value == 0 {
+                run++
+            } else {
+                while run >= 16 {
+                    this.write_code(ac, 0xf0)
+                    run -= 16
+                }
+                this.write_value(ac, run, value)
+                run = 0
+            }
+            k++
+        }
+        if run > 0 : this.write_code(ac, 0x00)
+    }
+}
+
+fn scaled_quant(base: u8, scale: uint) u16 {
+    let value = (base.to(uint) * scale + 50) / 100
+    if value < 1 : return 1
+    if value > 255 : return 255
+    return value.to(u16)
+}

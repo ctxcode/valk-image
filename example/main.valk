@@ -1,9 +1,10 @@
 use image
 
-// Makes a 300x200 thumbnail: `valk build . --run -- photo.png thumb.png`
+// Makes a 300x200 thumbnail: `valk build . --run -- photo.jpg thumb.jpg`
+// The formats follow the file extensions: .png, .jpg/.jpeg or .bmp
 fn main(args: Array[String]) {
-    let from = args.get(1) !? "photo.png"
-    let to = args.get(2) !? "thumb.png"
+    let from = args.get(1) !? "photo.jpg"
+    let to = args.get(2) !? "thumb.jpg"
     let photo = image.read(from) ! panic("Cannot read " + from + ": " + E.message)
     let thumb = photo.cover(300, 200) ! panic("Cannot resize: " + E.message)
     thumb.write(to) ! panic("Cannot write " + to + ": " + E.message)

@@ -1,0 +1,75 @@
+use image
+use valk.mem
+
+test "JPEG: baseline files decode within 2 levels of libjpeg" {
+    // References are djpeg's output for the same files
+    let names = Array[String]{ "photo-420", "photo-444", "photo-422", "photo-restart" }
+    each names as name {
+        let data = asset(name + ".jpg")
+        assert(image.is_jpeg(data))
+        let ours = image.decode(data) !!
+        let ref = image.decode_png(asset(name + "-ref.png")) !!
+        assert(ours.width == 37 && ours.height == 29 && ours.channels == 3)
+        assert(max_diff(ours, ref) <= 2)
+    }
+    let gray = image.decode_jpeg(asset("photo-gray.jpg")) !!
+    let gray_ref = image.decode_png(asset("photo-gray-ref.png")) !!
+    assert(gray.channels == 1 && max_diff(gray, gray_ref) <= 1)
+}
+
+test "JPEG: unsupported and malformed files are reported" {
+    image.decode_jpeg(asset("photo-progressive.jpg")) ! {
+        assert(E.code == E.unsupported)
+        assert(E.message.contains("Progressive"))
+    }
+    let data = asset("photo-420.jpg")
+    image.decode_jpeg(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)
+    image.decode_jpeg("\xff\xd8\xff\xd9") ! assert(E.code == E.invalid)
+    image.decode_jpeg("not a jpeg") ! assert(E.code == E.invalid)
+    assert(!image.is_jpeg("\xff\xd8"))
+}
+
+test "JPEG: encoding loses little and round-trips through our decoder" {
+    let photo = image.decode_png(asset("photo.png")) !!
+    let encoded = photo.encode_jpeg(90)
+    assert(image.is_jpeg(encoded))
+    let back = image.decode(encoded) !!
+    assert(back.width == 37 && back.height == 29 && back.channels == 3)
+    assert(mean_diff(photo, back) < 6.0)
+    assert(max_diff(photo, back) < 40)
+
+    // Without chroma subsampling and at the top quality the picture is nearly exact
+    let fine = image.decode_jpeg(photo.encode_jpeg(100, false)) !!
+    assert(max_diff(photo, fine) <= 6)
+    assert(mean_diff(photo, fine) < 1.0)
+
+    // Lower quality means a smaller file
+    assert(photo.encode_jpeg(30).bytes < encoded.bytes)
+
+    // Gray and RGBA (alpha dropped) sources
+    let gray = image.decode_png(asset("photo-gray.png")) !!
+    let gray_back = image.decode_jpeg(gray.encode_jpeg(90)) !!
+    assert(gray_back.channels == 1 && mean_diff(gray, gray_back) < 4.0)
+    let rgba = photo.to_rgba()
+    let rgba_back = image.decode_jpeg(rgba.encode_jpeg(90)) !!
+    assert(rgba_back.channels == 3 && max_diff(rgba_back, back) == 0)
+}
+
+test "JPEG: odd sizes and flat colors" {
+    let one = image.Image.new(1, 1, 3) !!
+    one.set_pixel(0, 0, .{ 10, 200, 90 })
+    let one_back = image.decode_jpeg(one.encode_jpeg(95)) !!
+    assert(one_back.width == 1 && one_back.height == 1)
+    assert(max_diff(one, one_back) <= 4)
+
+    let flat = image.Image.new(17, 9, 3) !!
+    let y: uint = 0
+    while y < 9 {
+        let x: uint = 0
+        while x < 17 : flat.set_pixel(x++, y, .{ 120, 60, 240 })
+        y++
+    }
+    let flat_back = image.decode_jpeg(flat.encode_jpeg(75)) !!
+    assert(max_diff(flat, flat_back) <= 3)
+    assert(mem.equals(flat_back.row(0), flat_back.row(8)))
+}
