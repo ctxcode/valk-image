@@ -1,0 +1,1254 @@
+use valk.mem
+
+// VP8 key frames (RFC 6386), as WebP stores lossy pictures: boolean entropy decoding,
+// intra prediction, the integer inverse DCT and WHT, and the loop filter. The optional
+// alpha plane of an extended (VP8X) file is decoded alongside.
+
+value NUM_BANDS (8)
+value NUM_CONTEXTS (3)
+value NUM_PROBS (11)
+value PLANE_Y1_WITH_Y2 (0)
+value PLANE_Y2 (1)
+value PLANE_UV (2)
+value PLANE_Y1_SANS_Y2 (3)
+value PRED_DC (0)
+value PRED_TM (1)
+value PRED_VE (2)
+value PRED_HE (3)
+value PRED_RD (4)
+value PRED_VR (5)
+value PRED_LD (6)
+value PRED_VL (7)
+value PRED_HD (8)
+value PRED_HU (9)
+value PRED_DC_TOP (10)
+value PRED_DC_LEFT (11)
+value PRED_DC_TOP_LEFT (12)
+value UNIFORM_PROB (128)
+// The work area: 26 rows of 32 samples with the luma block at (8, 1) and the chroma
+// blocks at (8, 18) and (24, 18), leaving their top and left neighbors in place
+value YBR_STRIDE (32)
+value YBR_Y (1 * 32 + 8)
+value YBR_B (18 * 32 + 8)
+value YBR_R (18 * 32 + 24)
+value COEFF_B (256)
+value COEFF_R (320)
+value COEFF_WHT (384)
+
+global coeff_bands: Array[u8] (Array[u8]{ 0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0 })
+global zigzag4: Array[u8] (Array[u8]{ 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 })
+global cat_probs: Array[u8] (Array[u8]{
+    173, 148, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    176, 155, 140, 135, 0, 0, 0, 0, 0, 0, 0, 0,
+    180, 157, 141, 134, 130, 0, 0, 0, 0, 0, 0, 0,
+    254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0,
+})
+
+// The boolean entropy decoder over one partition of the frame
+class BoolDecoder {
+    data: mut &[u8]
+    pos: uint
+    end: uint
+    range_m1: uint (254)
+    bits: uint (0)
+    n_bits: uint (0)
+    eof: bool (false)
+
+    fn read_bit(prob: uint) bool {
+        if this.n_bits < 8 {
+            if this.pos >= this.end {
+                this.eof = true
+                return false
+            }
+            this.bits = this.bits | (this.data[this.pos].to(uint) << (8 - this.n_bits))
+            this.pos++
+            this.n_bits += 8
+        }
+        let split = ((this.range_m1 * prob) >> 8) + 1
+        let bit = this.bits >= (split << 8)
+        if bit {
+            this.range_m1 -= split
+            this.bits -= split << 8
+        } else {
+            this.range_m1 = split - 1
+        }
+        if this.range_m1 < 127 {
+            let shift = lut_shift[this.range_m1].to(uint)
+            this.range_m1 = lut_range_m1[this.range_m1].to(uint)
+            this.bits = this.bits << shift
+            this.n_bits -= shift
+        }
+        return bit
+    }
+
+    fn read_uint(prob: uint, count: uint) uint {
+        let value: uint = 0
+        let n = count
+        while n > 0 {
+            n--
+            if this.read_bit(prob) : value = value | (1 << n)
+        }
+        return value
+    }
+
+    fn read_int(prob: uint, count: uint) int {
+        let value = this.read_uint(prob, count).to(int)
+        return this.read_bit(prob) ? 0 - value : value
+    }
+
+    fn read_optional_int(prob: uint, count: uint) int {
+        if !this.read_bit(prob) : return 0
+        return this.read_int(prob, count)
+    }
+}
+
+class Vp8Decoder {
+    data: mut &[u8]
+    width: uint (0)
+    height: uint (0)
+    mbw: uint (0)
+    mbh: uint (0)
+    // The picture planes, whole macroblocks
+    y_plane: mut &[u8] ([u8]{ 0 x 0 })
+    u_plane: mut &[u8] ([u8]{ 0 x 0 })
+    v_plane: mut &[u8] ([u8]{ 0 x 0 })
+    y_stride: uint (0)
+    c_stride: uint (0)
+    // Segmentation
+    use_segment: bool (false)
+    update_map: bool (false)
+    relative_delta: bool (false)
+    segment_quant: mut &[int] ([int]{ 0 x 4 })
+    segment_filter: mut &[int] ([int]{ 0 x 4 })
+    segment_probs: mut &[uint] ([uint]{ 255 x 3 })
+    // Loop filter header
+    filter_simple: bool (false)
+    filter_level: int (0)
+    sharpness: uint (0)
+    use_lf_delta: bool (false)
+    ref_lf_delta: mut &[int] ([int]{ 0 x 4 })
+    mode_lf_delta: mut &[int] ([int]{ 0 x 4 })
+    // Per segment, per (16x16 pred, 4x4 pred): level, interior level, hev threshold
+    filter_params: mut &[uint] ([uint]{ 0 x 4 * 2 * 3 })
+    // Per macroblock: level, ilevel, hlevel, inner
+    mb_filter: mut &[uint] ([uint]{ 0 x 0 })
+    // Dequantization per segment: y1 dc/ac, y2 dc/ac, uv dc/ac
+    quant: mut &[int] ([int]{ 0 x 24 })
+    token_probs: mut &[uint] ([uint]{ 0 x 1056 })
+    use_skip_prob: bool (false)
+    skip_prob: uint (0)
+    fp: ?BoolDecoder (null)
+    partitions: Array[BoolDecoder] (.{})
+    // Macroblock state: the segment, the predictors of the left and above blocks, and
+    // the non-zero flags used as token contexts
+    segment: uint (0)
+    left_pred: mut &[uint] ([uint]{ 0 x 4 })
+    up_pred: mut &[uint] ([uint]{ 0 x 0 })
+    left_nz: uint (0)
+    up_nz: mut &[uint] ([uint]{ 0 x 0 })
+    left_nz_y16: uint (0)
+    up_nz_y16: mut &[uint] ([uint]{ 0 x 0 })
+    nz_dc_mask: uint (0)
+    nz_ac_mask: uint (0)
+    use_pred_y16: bool (false)
+    pred_y16: uint (0)
+    pred_c8: uint (0)
+    pred_y4: mut &[uint] ([uint]{ 0 x 16 })
+    coeff: mut &[int] ([int]{ 0 x 400 })
+    ybr: mut &[u8] ([u8]{ 0 x 26 * 32 })
+
+    fn decode() !ImageError {
+        let data = this.data
+        if data.length < 10 : throw .invalid { message: "Truncated VP8 frame" }
+        let tag = data[0].to(uint) | (data[1].to(uint) << 8) | (data[2].to(uint) << 16)
+        if (tag & 1) != 0 : throw .unsupported { message: "VP8 inter frame" }
+        let first_partition_size = tag >> 5
+        if data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a : throw .invalid { message: "Bad VP8 start code" }
+        this.width = data[6].to(uint) | ((data[7] & 0x3f).to(uint) << 8)
+        this.height = data[8].to(uint) | ((data[9] & 0x3f).to(uint) << 8)
+        if this.width == 0 || this.height == 0 : throw .invalid { message: "Empty VP8 frame" }
+        if this.width * this.height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+        this.mbw = (this.width + 15) >> 4
+        this.mbh = (this.height + 15) >> 4
+        this.y_stride = this.mbw * 16
+        this.c_stride = this.mbw * 8
+        this.y_plane = [u8]{ 0 x this.y_stride * this.mbh * 16 }
+        this.u_plane = [u8]{ 0 x this.c_stride * this.mbh * 8 }
+        this.v_plane = [u8]{ 0 x this.c_stride * this.mbh * 8 }
+        this.mb_filter = [uint]{ 0 x this.mbw * this.mbh * 4 }
+        this.up_pred = [uint]{ 0 x this.mbw * 4 }
+        this.up_nz = [uint]{ 0 x this.mbw }
+        this.up_nz_y16 = [uint]{ 0 x this.mbw }
+        let i: uint = 0
+        while i < 1056 {
+            this.token_probs[i] = default_token_probs[i].to(uint)
+            i++
+        }
+        if 10 + first_partition_size > data.length : throw .invalid { message: "Truncated VP8 partition" }
+        let fp = BoolDecoder{ data: data, pos: 10, end: 10 + first_partition_size }
+        this.fp = fp
+        // Color space and clamping type: nothing to do for either
+        fp.read_bit(UNIFORM_PROB)
+        fp.read_bit(UNIFORM_PROB)
+        this.parse_segment_header(fp)
+        this.parse_filter_header(fp)
+        this.parse_partitions(fp, 10 + first_partition_size) !>
+        this.parse_quant(fp)
+        // refresh_entropy_probs: meaningless for a single frame
+        fp.read_bit(UNIFORM_PROB)
+        i = 0
+        while i < 1056 {
+            if fp.read_bit(token_update_probs[i].to(uint)) : this.token_probs[i] = fp.read_uint(UNIFORM_PROB, 8)
+            i++
+        }
+        this.use_skip_prob = fp.read_bit(UNIFORM_PROB)
+        if this.use_skip_prob : this.skip_prob = fp.read_uint(UNIFORM_PROB, 8)
+        if fp.eof : throw .invalid { message: "VP8 header ends early" }
+
+        let mby: uint = 0
+        while mby < this.mbh {
+            this.left_nz = 0
+            this.left_nz_y16 = 0
+            i = 0
+            while i < 4 : this.left_pred[i++] = PRED_DC
+            let mbx: uint = 0
+            while mbx < this.mbw {
+                let skip = this.reconstruct(mbx, mby, fp)
+                let params = (this.segment * 2 + (this.use_pred_y16 ? 0 : 1)) * 3
+                let at = (mby * this.mbw + mbx) * 4
+                this.mb_filter[at] = this.filter_params[params]
+                this.mb_filter[at + 1] = this.filter_params[params + 1]
+                this.mb_filter[at + 2] = this.filter_params[params + 2]
+                this.mb_filter[at + 3] = (!this.use_pred_y16 || !skip) ? 1 : 0
+                mbx++
+            }
+            mby++
+        }
+        if fp.eof : throw .invalid { message: "VP8 data ends early" }
+        each this.partitions as partition : if partition.eof : throw .invalid { message: "VP8 data ends early" }
+        if this.filter_level != 0 {
+            if this.filter_simple : this.simple_filter()
+            else : this.normal_filter()
+        }
+    }
+
+    fn parse_segment_header(fp: BoolDecoder) {
+        this.use_segment = fp.read_bit(UNIFORM_PROB)
+        if !this.use_segment : return
+        this.update_map = fp.read_bit(UNIFORM_PROB)
+        if fp.read_bit(UNIFORM_PROB) {
+            this.relative_delta = !fp.read_bit(UNIFORM_PROB)
+            let i: uint = 0
+            while i < 4 : this.segment_quant[i++] = fp.read_optional_int(UNIFORM_PROB, 7)
+            i = 0
+            while i < 4 : this.segment_filter[i++] = fp.read_optional_int(UNIFORM_PROB, 6)
+        }
+        if !this.update_map : return
+        let i: uint = 0
+        while i < 3 {
+            this.segment_probs[i] = fp.read_bit(UNIFORM_PROB) ? fp.read_uint(UNIFORM_PROB, 8) : 255
+            i++
+        }
+    }
+
+    fn parse_filter_header(fp: BoolDecoder) {
+        this.filter_simple = fp.read_bit(UNIFORM_PROB)
+        this.filter_level = fp.read_uint(UNIFORM_PROB, 6).to(int)
+        this.sharpness = fp.read_uint(UNIFORM_PROB, 3)
+        this.use_lf_delta = fp.read_bit(UNIFORM_PROB)
+        if this.use_lf_delta && fp.read_bit(UNIFORM_PROB) {
+            let i: uint = 0
+            while i < 4 : this.ref_lf_delta[i++] = fp.read_optional_int(UNIFORM_PROB, 6)
+            i = 0
+            while i < 4 : this.mode_lf_delta[i++] = fp.read_optional_int(UNIFORM_PROB, 6)
+        }
+        if this.filter_level == 0 : return
+        this.compute_filter_params()
+    }
+
+    fn compute_filter_params() {
+        let segment: uint = 0
+        while segment < 4 {
+            let base_level = this.filter_level
+            if this.use_segment {
+                base_level = this.segment_filter[segment]
+                if this.relative_delta : base_level += this.filter_level
+            }
+            let j: uint = 0
+            while j < 2 {
+                let at = (segment * 2 + j) * 3
+                let level = base_level
+                if this.use_lf_delta {
+                    level += this.ref_lf_delta[0]
+                    if j != 0 : level += this.mode_lf_delta[0]
+                }
+                if level <= 0 {
+                    this.filter_params[at] = 0
+                    j++
+                    continue
+                }
+                if level > 63 : level = 63
+                let ilevel = level
+                if this.sharpness > 0 {
+                    ilevel = this.sharpness > 4 ? ilevel >> 2 : ilevel >> 1
+                    let most = 9 - this.sharpness.to(int)
+                    if ilevel > most : ilevel = most
+                }
+                if ilevel < 1 : ilevel = 1
+                this.filter_params[at] = (2 * level + ilevel).to(uint)
+                this.filter_params[at + 1] = ilevel.to(uint)
+                this.filter_params[at + 2] = level < 15 ? 0 : (level < 40 ? 1 : 2)
+                j++
+            }
+            segment++
+        }
+    }
+
+    fn parse_partitions(fp: BoolDecoder, start: uint) !ImageError {
+        let count: uint = 1 << fp.read_uint(UNIFORM_PROB, 2)
+        let sizes_bytes = 3 * (count - 1)
+        if start + sizes_bytes > this.data.length : throw .invalid { message: "Truncated VP8 partition sizes" }
+        let pos = start + sizes_bytes
+        let i: uint = 0
+        while i < count {
+            let size = this.data.length - pos
+            if i < count - 1 {
+                let at = start + i * 3
+                size = this.data[at].to(uint) | (this.data[at + 1].to(uint) << 8) | (this.data[at + 2].to(uint) << 16)
+                if pos + size > this.data.length : throw .invalid { message: "Truncated VP8 partition" }
+            }
+            this.partitions.append(BoolDecoder{ data: this.data, pos: pos, end: pos + size })
+            pos += size
+            i++
+        }
+    }
+
+    fn parse_quant(fp: BoolDecoder) {
+        let base = fp.read_uint(UNIFORM_PROB, 7).to(int)
+        let y1_dc = fp.read_optional_int(UNIFORM_PROB, 4)
+        let y2_dc = fp.read_optional_int(UNIFORM_PROB, 4)
+        let y2_ac = fp.read_optional_int(UNIFORM_PROB, 4)
+        let uv_dc = fp.read_optional_int(UNIFORM_PROB, 4)
+        let uv_ac = fp.read_optional_int(UNIFORM_PROB, 4)
+        let segment: uint = 0
+        while segment < 4 {
+            let q = base
+            if this.use_segment {
+                q = this.relative_delta ? q + this.segment_quant[segment] : this.segment_quant[segment]
+            }
+            let at = segment * 6
+            this.quant[at] = dequant_dc[clip_index(q + y1_dc, 127)].to(int)
+            this.quant[at + 1] = dequant_ac[clip_index(q, 127)].to(int)
+            this.quant[at + 2] = dequant_dc[clip_index(q + y2_dc, 127)].to(int) * 2
+            let y2ac = dequant_ac[clip_index(q + y2_ac, 127)].to(int) * 155 / 100
+            this.quant[at + 3] = y2ac < 8 ? 8 : y2ac
+            this.quant[at + 4] = dequant_dc[clip_index(q + uv_dc, 117)].to(int)
+            this.quant[at + 5] = dequant_ac[clip_index(q + uv_ac, 127)].to(int)
+            segment++
+        }
+    }
+
+    // One macroblock: its modes from the first partition, its residuals from the token
+    // partition of its row, then prediction plus residual into the picture
+    fn reconstruct(mbx: uint, mby: uint, fp: BoolDecoder) bool {
+        if this.update_map {
+            if !fp.read_bit(this.segment_probs[0]) : this.segment = fp.read_uint(this.segment_probs[1], 1)
+            else : this.segment = fp.read_uint(this.segment_probs[2], 1) + 2
+        }
+        let skip = this.use_skip_prob ? fp.read_bit(this.skip_prob) : false
+        let i: uint = 0
+        while i < 400 : this.coeff[i++] = 0
+        this.prepare_ybr(mbx, mby)
+        this.use_pred_y16 = fp.read_bit(145)
+        if this.use_pred_y16 : this.parse_pred_mode_y16(mbx, fp)
+        else : this.parse_pred_mode_y4(mbx, fp)
+        this.parse_pred_mode_c8(fp)
+        if !skip {
+            skip = this.parse_residuals(mbx, mby)
+        } else {
+            if this.use_pred_y16 {
+                this.left_nz_y16 = 0
+                this.up_nz_y16[mbx] = 0
+            }
+            this.left_nz = 0
+            this.up_nz[mbx] = 0
+            this.nz_dc_mask = 0
+            this.nz_ac_mask = 0
+        }
+        this.reconstruct_macroblock(mbx, mby)
+        // Copy the work area into the planes
+        let ybr = this.ybr
+        let y: uint = 0
+        while y < 16 {
+            mem.copy(ybr.view(YBR_Y + y * YBR_STRIDE, 16), this.y_plane.view((mby * 16 + y) * this.y_stride + mbx * 16, 16))
+            y++
+        }
+        y = 0
+        while y < 8 {
+            mem.copy(ybr.view(YBR_B + y * YBR_STRIDE, 8), this.u_plane.view((mby * 8 + y) * this.c_stride + mbx * 8, 8))
+            mem.copy(ybr.view(YBR_R + y * YBR_STRIDE, 8), this.v_plane.view((mby * 8 + y) * this.c_stride + mbx * 8, 8))
+            y++
+        }
+        return skip
+    }
+
+    // Fills the work area's border with the neighbors: the row above (with four extra
+    // luma samples to the right), the column to the left, and the corner
+    fn prepare_ybr(mbx: uint, mby: uint) {
+        let ybr = this.ybr
+        if mbx == 0 {
+            let y: uint = 0
+            while y < 17 : ybr[(y++) * YBR_STRIDE + 7] = 0x81
+            y = 17
+            while y < 26 {
+                ybr[y * YBR_STRIDE + 7] = 0x81
+                ybr[y * YBR_STRIDE + 23] = 0x81
+                y++
+            }
+        } else {
+            let y: uint = 0
+            while y < 17 {
+                ybr[y * YBR_STRIDE + 7] = ybr[y * YBR_STRIDE + 23]
+                y++
+            }
+            y = 17
+            while y < 26 {
+                ybr[y * YBR_STRIDE + 7] = ybr[y * YBR_STRIDE + 15]
+                ybr[y * YBR_STRIDE + 23] = ybr[y * YBR_STRIDE + 31]
+                y++
+            }
+        }
+        if mby == 0 {
+            let x: uint = 7
+            while x < 28 : ybr[x++] = 0x7f
+            x = 7
+            while x < 16 : ybr[17 * YBR_STRIDE + (x++)] = 0x7f
+            x = 23
+            while x < 32 : ybr[17 * YBR_STRIDE + (x++)] = 0x7f
+        } else {
+            let y_row = (16 * mby - 1) * this.y_stride + 16 * mbx
+            let c_row = (8 * mby - 1) * this.c_stride + 8 * mbx
+            let i: uint = 0
+            while i < 16 {
+                ybr[8 + i] = this.y_plane[y_row + i]
+                i++
+            }
+            i = 0
+            while i < 8 {
+                ybr[17 * YBR_STRIDE + 8 + i] = this.u_plane[c_row + i]
+                ybr[17 * YBR_STRIDE + 24 + i] = this.v_plane[c_row + i]
+                i++
+            }
+            i = 16
+            while i < 20 {
+                ybr[8 + i] = mbx == this.mbw - 1 ? this.y_plane[y_row + 15] : this.y_plane[y_row + i]
+                i++
+            }
+        }
+        // The above-right samples repeat down the right edge for the 4x4 predictors
+        let y: uint = 4
+        while y < 16 {
+            ybr[y * YBR_STRIDE + 24] = ybr[24]
+            ybr[y * YBR_STRIDE + 25] = ybr[25]
+            ybr[y * YBR_STRIDE + 26] = ybr[26]
+            ybr[y * YBR_STRIDE + 27] = ybr[27]
+            y += 4
+        }
+    }
+
+    fn parse_pred_mode_y16(mbx: uint, fp: BoolDecoder) {
+        let mode: uint = PRED_DC
+        if !fp.read_bit(156) {
+            mode = fp.read_bit(163) ? PRED_VE : PRED_DC
+        } else {
+            mode = fp.read_bit(128) ? PRED_TM : PRED_HE
+        }
+        let i: uint = 0
+        while i < 4 {
+            this.up_pred[mbx * 4 + i] = mode
+            this.left_pred[i] = mode
+            i++
+        }
+        this.pred_y16 = mode
+    }
+
+    fn parse_pred_mode_c8(fp: BoolDecoder) {
+        if !fp.read_bit(142) : this.pred_c8 = PRED_DC
+        else if !fp.read_bit(114) : this.pred_c8 = PRED_VE
+        else if !fp.read_bit(183) : this.pred_c8 = PRED_HE
+        else : this.pred_c8 = PRED_TM
+    }
+
+    fn parse_pred_mode_y4(mbx: uint, fp: BoolDecoder) {
+        let j: uint = 0
+        while j < 4 {
+            let mode = this.left_pred[j]
+            let i: uint = 0
+            while i < 4 {
+                let probs = (this.up_pred[mbx * 4 + i] * 10 + mode) * 9
+                if !fp.read_bit(pred_probs[probs].to(uint)) : mode = PRED_DC
+                else if !fp.read_bit(pred_probs[probs + 1].to(uint)) : mode = PRED_TM
+                else if !fp.read_bit(pred_probs[probs + 2].to(uint)) : mode = PRED_VE
+                else if !fp.read_bit(pred_probs[probs + 3].to(uint)) {
+                    if !fp.read_bit(pred_probs[probs + 4].to(uint)) : mode = PRED_HE
+                    else if !fp.read_bit(pred_probs[probs + 5].to(uint)) : mode = PRED_RD
+                    else : mode = PRED_VR
+                } else if !fp.read_bit(pred_probs[probs + 6].to(uint)) : mode = PRED_LD
+                else if !fp.read_bit(pred_probs[probs + 7].to(uint)) : mode = PRED_VL
+                else if !fp.read_bit(pred_probs[probs + 8].to(uint)) : mode = PRED_HD
+                else : mode = PRED_HU
+                this.pred_y4[j * 4 + i] = mode
+                this.up_pred[mbx * 4 + i] = mode
+                i++
+            }
+            this.left_pred[j] = mode
+            j++
+        }
+    }
+
+    // The tokens of one 4x4 block; returns whether any coefficient was non-zero
+    fn parse_residuals4(partition: BoolDecoder, plane: uint, context: uint, quant_dc: int, quant_ac: int, skip_first: bool, base: uint) uint {
+        let probs = this.token_probs
+        let plane_base = plane * NUM_BANDS * NUM_CONTEXTS * NUM_PROBS
+        let n: uint = skip_first ? 1 : 0
+        let p = plane_base + (coeff_bands[n].to(uint) * NUM_CONTEXTS + context) * NUM_PROBS
+        if !partition.read_bit(probs[p]) : return 0
+        while n != 16 {
+            n++
+            if !partition.read_bit(probs[p + 1]) {
+                p = plane_base + (coeff_bands[n].to(uint) * NUM_CONTEXTS) * NUM_PROBS
+                continue
+            }
+            let value: uint = 0
+            if !partition.read_bit(probs[p + 2]) {
+                value = 1
+                p = plane_base + (coeff_bands[n].to(uint) * NUM_CONTEXTS + 1) * NUM_PROBS
+            } else {
+                if !partition.read_bit(probs[p + 3]) {
+                    if !partition.read_bit(probs[p + 4]) : value = 2
+                    else : value = 3 + partition.read_uint(probs[p + 5], 1)
+                } else if !partition.read_bit(probs[p + 6]) {
+                    if !partition.read_bit(probs[p + 7]) : value = 5 + partition.read_uint(159, 1)
+                    else : value = 7 + 2 * partition.read_uint(165, 1) + partition.read_uint(145, 1)
+                } else {
+                    let b1 = partition.read_uint(probs[p + 8], 1)
+                    let b0 = partition.read_uint(probs[p + 9 + b1], 1)
+                    let cat = 2 * b1 + b0
+                    let i: uint = 0
+                    while cat_probs[cat * 12 + i] != 0 {
+                        value = value * 2 + partition.read_uint(cat_probs[cat * 12 + i].to(uint), 1)
+                        i++
+                    }
+                    value += 3 + (8 << cat)
+                }
+                p = plane_base + (coeff_bands[n].to(uint) * NUM_CONTEXTS + 2) * NUM_PROBS
+            }
+            let z = zigzag4[n - 1].to(uint)
+            let c = value.to(int) * (z > 0 ? quant_ac : quant_dc)
+            if partition.read_bit(UNIFORM_PROB) : c = 0 - c
+            this.coeff[base + z] = c
+            if n == 16 || !partition.read_bit(probs[p]) : return 1
+        }
+        return 1
+    }
+
+    fn parse_residuals(mbx: uint, mby: uint) bool {
+        let partition = this.partitions[mby & (this.partitions.length - 1)]
+        let plane: uint = PLANE_Y1_SANS_Y2
+        let q = this.segment * 6
+        if this.use_pred_y16 {
+            let nz = this.parse_residuals4(partition, PLANE_Y2, this.left_nz_y16 + this.up_nz_y16[mbx], this.quant[q + 2], this.quant[q + 3], false, COEFF_WHT)
+            this.left_nz_y16 = nz
+            this.up_nz_y16[mbx] = nz
+            this.inverse_wht()
+            plane = PLANE_Y1_WITH_Y2
+        }
+        let nz_dc_mask: uint = 0
+        let nz_ac_mask: uint = 0
+        let base: uint = 0
+        // The 4x4 luma blocks, contexts from the left column and the row above
+        let lnz = this.left_nz & 0x0f
+        let unz = this.up_nz[mbx] & 0x0f
+        let y: uint = 0
+        while y < 4 {
+            let nz = (lnz >> y) & 1
+            let x: uint = 0
+            while x < 4 {
+                nz = this.parse_residuals4(partition, plane, nz + ((unz >> x) & 1), this.quant[q], this.quant[q + 1], this.use_pred_y16, base)
+                unz = (unz & ~(1 << x)) | (nz << x)
+                if nz != 0 : nz_ac_mask = nz_ac_mask | (1 << (y * 4 + x))
+                if this.coeff[base] != 0 : nz_dc_mask = nz_dc_mask | (1 << (y * 4 + x))
+                base += 16
+                x++
+            }
+            lnz = (lnz & ~(1 << y)) | (nz << y)
+            y++
+        }
+        let left_mask = lnz
+        let up_mask = unz
+        // The chroma blocks: two 2x2 groups, contexts in the high nibble
+        lnz = this.left_nz >> 4
+        unz = this.up_nz[mbx] >> 4
+        let c: uint = 0
+        while c < 4 {
+            y = 0
+            while y < 2 {
+                let nz = (lnz >> (y + c)) & 1
+                let x: uint = 0
+                while x < 2 {
+                    nz = this.parse_residuals4(partition, PLANE_UV, nz + ((unz >> (x + c)) & 1), this.quant[q + 4], this.quant[q + 5], false, base)
+                    unz = (unz & ~(1 << (x + c))) | (nz << (x + c))
+                    let bit: uint = 16 + c * 2 + y * 2 + x
+                    if nz != 0 : nz_ac_mask = nz_ac_mask | (1 << bit)
+                    if this.coeff[base] != 0 : nz_dc_mask = nz_dc_mask | (1 << bit)
+                    base += 16
+                    x++
+                }
+                lnz = (lnz & ~(1 << (y + c))) | (nz << (y + c))
+                y++
+            }
+            c += 2
+        }
+        this.left_nz = left_mask | (lnz << 4)
+        this.up_nz[mbx] = up_mask | (unz << 4)
+        this.nz_dc_mask = nz_dc_mask
+        this.nz_ac_mask = nz_ac_mask
+        return nz_dc_mask == 0 && nz_ac_mask == 0
+    }
+
+    fn reconstruct_macroblock(mbx: uint, mby: uint) {
+        if this.use_pred_y16 {
+            this.predict_large(YBR_Y, 16, edge_mode(mbx, mby, this.pred_y16))
+            let n: uint = 0
+            while n < 16 {
+                let at = YBR_Y + (n / 4) * 4 * YBR_STRIDE + (n % 4) * 4
+                this.add_residual(at, n * 16)
+                n++
+            }
+        } else {
+            let n: uint = 0
+            while n < 16 {
+                let at = YBR_Y + (n / 4) * 4 * YBR_STRIDE + (n % 4) * 4
+                this.predict4(at, this.pred_y4[n])
+                this.add_residual(at, n * 16)
+                n++
+            }
+        }
+        let mode = edge_mode(mbx, mby, this.pred_c8)
+        this.predict_large(YBR_B, 8, mode)
+        this.predict_large(YBR_R, 8, mode)
+        let n: uint = 16
+        while n < 24 {
+            let block = n - 16
+            let at = (block < 4 ? YBR_B : YBR_R) + ((block % 4) / 2) * 4 * YBR_STRIDE + (block % 2) * 4
+            this.add_residual(at, n * 16)
+            n++
+        }
+    }
+
+    // Adds block `n`'s inverse transform to the predicted samples at `at`
+    fn add_residual(at: uint, base: uint) {
+        let n = base / 16
+        if (this.nz_ac_mask & (1 << n)) != 0 : this.inverse_dct(at, base)
+        else if (this.nz_dc_mask & (1 << n)) != 0 : this.inverse_dct_dc(at, base)
+    }
+
+    fn inverse_dct(at: uint, base: uint) {
+        let coeff = this.coeff
+        let ybr = this.ybr
+        let m = [int]{ 0 x 16 }
+        let i: uint = 0
+        while i < 4 {
+            let c0 = coeff[base + i]
+            let c4 = coeff[base + 4 + i]
+            let c8 = coeff[base + 8 + i]
+            let c12 = coeff[base + 12 + i]
+            let a = c0 + c8
+            let b = c0 - c8
+            let c = ((c4 * 35468) >> 16) - ((c12 * 85627) >> 16)
+            let d = ((c4 * 85627) >> 16) + ((c12 * 35468) >> 16)
+            m[i * 4] = a + d
+            m[i * 4 + 1] = b + c
+            m[i * 4 + 2] = b - c
+            m[i * 4 + 3] = a - d
+            i++
+        }
+        let j: uint = 0
+        while j < 4 {
+            let dc = m[j] + 4
+            let a = dc + m[8 + j]
+            let b = dc - m[8 + j]
+            let c = ((m[4 + j] * 35468) >> 16) - ((m[12 + j] * 85627) >> 16)
+            let d = ((m[4 + j] * 85627) >> 16) + ((m[12 + j] * 35468) >> 16)
+            let row = at + j * YBR_STRIDE
+            ybr[row] = clip_pixel(ybr[row].to(int) + ((a + d) >> 3))
+            ybr[row + 1] = clip_pixel(ybr[row + 1].to(int) + ((b + c) >> 3))
+            ybr[row + 2] = clip_pixel(ybr[row + 2].to(int) + ((b - c) >> 3))
+            ybr[row + 3] = clip_pixel(ybr[row + 3].to(int) + ((a - d) >> 3))
+            j++
+        }
+    }
+
+    fn inverse_dct_dc(at: uint, base: uint) {
+        let dc = (this.coeff[base] + 4) >> 3
+        let ybr = this.ybr
+        let j: uint = 0
+        while j < 4 {
+            let row = at + j * YBR_STRIDE
+            let i: uint = 0
+            while i < 4 {
+                ybr[row + i] = clip_pixel(ybr[row + i].to(int) + dc)
+                i++
+            }
+            j++
+        }
+    }
+
+    // The second-order transform spreads the luma DC values over the 16 blocks
+    fn inverse_wht() {
+        let coeff = this.coeff
+        let m = [int]{ 0 x 16 }
+        let i: uint = 0
+        while i < 4 {
+            let a0 = coeff[COEFF_WHT + i] + coeff[COEFF_WHT + 12 + i]
+            let a1 = coeff[COEFF_WHT + 4 + i] + coeff[COEFF_WHT + 8 + i]
+            let a2 = coeff[COEFF_WHT + 4 + i] - coeff[COEFF_WHT + 8 + i]
+            let a3 = coeff[COEFF_WHT + i] - coeff[COEFF_WHT + 12 + i]
+            m[i] = a0 + a1
+            m[8 + i] = a0 - a1
+            m[4 + i] = a3 + a2
+            m[12 + i] = a3 - a2
+            i++
+        }
+        let out: uint = 0
+        i = 0
+        while i < 4 {
+            let dc = m[i * 4] + 3
+            let a0 = dc + m[3 + i * 4]
+            let a1 = m[1 + i * 4] + m[2 + i * 4]
+            let a2 = m[1 + i * 4] - m[2 + i * 4]
+            let a3 = dc - m[3 + i * 4]
+            coeff[out] = (a0 + a1) >> 3
+            coeff[out + 16] = (a3 + a2) >> 3
+            coeff[out + 32] = (a0 - a1) >> 3
+            coeff[out + 48] = (a3 - a2) >> 3
+            out += 64
+            i++
+        }
+    }
+
+    // Intra prediction of a 16x16 luma or 8x8 chroma block from its border
+    fn predict_large(at: uint, size: uint, mode: uint) {
+        let ybr = this.ybr
+        let j: uint = 0
+        if mode == PRED_VE {
+            while j < size {
+                let i: uint = 0
+                while i < size {
+                    ybr[at + j * YBR_STRIDE + i] = ybr[at - YBR_STRIDE + i]
+                    i++
+                }
+                j++
+            }
+            return
+        }
+        if mode == PRED_HE {
+            while j < size {
+                let i: uint = 0
+                while i < size {
+                    ybr[at + j * YBR_STRIDE + i] = ybr[at + j * YBR_STRIDE - 1]
+                    i++
+                }
+                j++
+            }
+            return
+        }
+        if mode == PRED_TM {
+            let corner = ybr[at - YBR_STRIDE - 1].to(int)
+            while j < size {
+                let left = ybr[at + j * YBR_STRIDE - 1].to(int) - corner
+                let i: uint = 0
+                while i < size {
+                    ybr[at + j * YBR_STRIDE + i] = clip_pixel(left + ybr[at - YBR_STRIDE + i].to(int))
+                    i++
+                }
+                j++
+            }
+            return
+        }
+        // The DC modes: the average of whichever borders exist
+        let shift: uint = size == 16 ? 4 : 3
+        let value: uint = 0x80
+        if mode == PRED_DC {
+            let sum: uint = size
+            let i: uint = 0
+            while i < size {
+                sum += ybr[at - YBR_STRIDE + i].to(uint) + ybr[at + i * YBR_STRIDE - 1].to(uint)
+                i++
+            }
+            value = sum >> (shift + 1)
+        } else if mode == PRED_DC_TOP {
+            let sum: uint = size / 2
+            let i: uint = 0
+            while i < size : sum += ybr[at + (i++) * YBR_STRIDE - 1].to(uint)
+            value = sum >> shift
+        } else if mode == PRED_DC_LEFT {
+            let sum: uint = size / 2
+            let i: uint = 0
+            while i < size : sum += ybr[at - YBR_STRIDE + (i++)].to(uint)
+            value = sum >> shift
+        }
+        while j < size {
+            let i: uint = 0
+            while i < size {
+                ybr[at + j * YBR_STRIDE + i] = value.to(u8)
+                i++
+            }
+            j++
+        }
+    }
+
+    // The ten 4x4 luma predictors
+    fn predict4(at: uint, mode: uint) {
+        let ybr = this.ybr
+        // Border samples: the row above (a..h, with a-1 the corner) and the column left
+        let top = at - YBR_STRIDE
+        let corner = ybr[top - 1].to(int)
+        let a = ybr[top].to(int)
+        let b = ybr[top + 1].to(int)
+        let c = ybr[top + 2].to(int)
+        let d = ybr[top + 3].to(int)
+        let e = ybr[top + 4].to(int)
+        let f = ybr[top + 5].to(int)
+        let g = ybr[top + 6].to(int)
+        let h = ybr[top + 7].to(int)
+        let p = ybr[at - 1].to(int)
+        let q = ybr[at + YBR_STRIDE - 1].to(int)
+        let r = ybr[at + 2 * YBR_STRIDE - 1].to(int)
+        let s = ybr[at + 3 * YBR_STRIDE - 1].to(int)
+        let out = [u8]{ 0 x 16 }
+        if mode == PRED_DC {
+            let avg = ((a + b + c + d + p + q + r + s + 4) / 8).to(u8)
+            let i: uint = 0
+            while i < 16 : out[i++] = avg
+        } else if mode == PRED_TM {
+            let j: uint = 0
+            while j < 4 {
+                let left = ybr[at + j * YBR_STRIDE - 1].to(int) - corner
+                let i: uint = 0
+                while i < 4 {
+                    out[j * 4 + i] = clip_pixel(left + ybr[top + i].to(int))
+                    i++
+                }
+                j++
+            }
+        } else if mode == PRED_VE {
+            let abc = avg3(corner, a, b)
+            let bcd = avg3(a, b, c)
+            let cde = avg3(b, c, d)
+            let def = avg3(c, d, e)
+            let j: uint = 0
+            while j < 4 {
+                out[j * 4] = abc
+                out[j * 4 + 1] = bcd
+                out[j * 4 + 2] = cde
+                out[j * 4 + 3] = def
+                j++
+            }
+        } else if mode == PRED_HE {
+            let rows = Array[u8]{ avg3(corner, p, q), avg3(p, q, r), avg3(q, r, s), avg3(r, s, s) }
+            let j: uint = 0
+            while j < 4 {
+                let i: uint = 0
+                while i < 4 : out[j * 4 + (i++)] = rows[j]
+                j++
+            }
+        } else if mode == PRED_RD {
+            let srq = avg3(s, r, q)
+            let rqp = avg3(r, q, p)
+            let qpa = avg3(q, p, corner)
+            let pab = avg3(p, corner, a)
+            let abc = avg3(corner, a, b)
+            let bcd = avg3(a, b, c)
+            let cde = avg3(b, c, d)
+            fill4(out, .{ pab, abc, bcd, cde, qpa, pab, abc, bcd, rqp, qpa, pab, abc, srq, rqp, qpa, pab })
+        } else if mode == PRED_VR {
+            let ab = avg2(corner, a)
+            let bc = avg2(a, b)
+            let cd = avg2(b, c)
+            let de = avg2(c, d)
+            let rqp = avg3(r, q, p)
+            let qpa = avg3(q, p, corner)
+            let pab = avg3(p, corner, a)
+            let abc = avg3(corner, a, b)
+            let bcd = avg3(a, b, c)
+            let cde = avg3(b, c, d)
+            fill4(out, .{ ab, bc, cd, de, pab, abc, bcd, cde, qpa, ab, bc, cd, rqp, pab, abc, bcd })
+        } else if mode == PRED_LD {
+            let abc = avg3(a, b, c)
+            let bcd = avg3(b, c, d)
+            let cde = avg3(c, d, e)
+            let def = avg3(d, e, f)
+            let efg = avg3(e, f, g)
+            let fgh = avg3(f, g, h)
+            let ghh = avg3(g, h, h)
+            fill4(out, .{ abc, bcd, cde, def, bcd, cde, def, efg, cde, def, efg, fgh, def, efg, fgh, ghh })
+        } else if mode == PRED_VL {
+            let ab = avg2(a, b)
+            let bc = avg2(b, c)
+            let cd = avg2(c, d)
+            let de = avg2(d, e)
+            let abc = avg3(a, b, c)
+            let bcd = avg3(b, c, d)
+            let cde = avg3(c, d, e)
+            let def = avg3(d, e, f)
+            let efg = avg3(e, f, g)
+            let fgh = avg3(f, g, h)
+            fill4(out, .{ ab, bc, cd, de, abc, bcd, cde, def, bc, cd, de, efg, bcd, cde, def, fgh })
+        } else if mode == PRED_HD {
+            let sr = avg2(s, r)
+            let rq = avg2(r, q)
+            let qp = avg2(q, p)
+            let pa = avg2(p, corner)
+            let srq = avg3(s, r, q)
+            let rqp = avg3(r, q, p)
+            let qpa = avg3(q, p, corner)
+            let pab = avg3(p, corner, a)
+            let abc = avg3(corner, a, b)
+            let bcd = avg3(a, b, c)
+            fill4(out, .{ pa, pab, abc, bcd, qp, qpa, pa, pab, rq, rqp, qp, qpa, sr, srq, rq, rqp })
+        } else {
+            let pq = avg2(p, q)
+            let qr = avg2(q, r)
+            let rs = avg2(r, s)
+            let pqr = avg3(p, q, r)
+            let qrs = avg3(q, r, s)
+            let rss = avg3(r, s, s)
+            let sss = s.to(u8)
+            fill4(out, .{ pq, pqr, qr, qrs, qr, qrs, rs, rss, rs, rss, sss, sss, sss, sss, sss, sss })
+        }
+        let j: uint = 0
+        while j < 4 {
+            let i: uint = 0
+            while i < 4 {
+                ybr[at + j * YBR_STRIDE + i] = out[j * 4 + i]
+                i++
+            }
+            j++
+        }
+    }
+
+    fn simple_filter() {
+        let mby: uint = 0
+        while mby < this.mbh {
+            let mbx: uint = 0
+            while mbx < this.mbw {
+                let at = (mby * this.mbw + mbx) * 4
+                let level = this.mb_filter[at].to(int)
+                let inner = this.mb_filter[at + 3] == 1
+                if level != 0 {
+                    let index = (mby * this.y_stride + mbx) * 16
+                    let stride = this.y_stride
+                    if mbx > 0 : filter2(this.y_plane, level + 4, index, stride, 1)
+                    if inner {
+                        filter2(this.y_plane, level, index + 4, stride, 1)
+                        filter2(this.y_plane, level, index + 8, stride, 1)
+                        filter2(this.y_plane, level, index + 12, stride, 1)
+                    }
+                    if mby > 0 : filter2(this.y_plane, level + 4, index, 1, stride)
+                    if inner {
+                        filter2(this.y_plane, level, index + stride * 4, 1, stride)
+                        filter2(this.y_plane, level, index + stride * 8, 1, stride)
+                        filter2(this.y_plane, level, index + stride * 12, 1, stride)
+                    }
+                }
+                mbx++
+            }
+            mby++
+        }
+    }
+
+    fn normal_filter() {
+        let mby: uint = 0
+        while mby < this.mbh {
+            let mbx: uint = 0
+            while mbx < this.mbw {
+                let at = (mby * this.mbw + mbx) * 4
+                let level = this.mb_filter[at].to(int)
+                let ilevel = this.mb_filter[at + 1].to(int)
+                let hlevel = this.mb_filter[at + 2].to(int)
+                let inner = this.mb_filter[at + 3] == 1
+                if level != 0 {
+                    let ys = this.y_stride
+                    let cs = this.c_stride
+                    let yi = (mby * ys + mbx) * 16
+                    let ci = (mby * cs + mbx) * 8
+                    if mbx > 0 {
+                        filter246(this.y_plane, 16, level + 4, ilevel, hlevel, yi, ys, 1, false)
+                        filter246(this.u_plane, 8, level + 4, ilevel, hlevel, ci, cs, 1, false)
+                        filter246(this.v_plane, 8, level + 4, ilevel, hlevel, ci, cs, 1, false)
+                    }
+                    if inner {
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + 4, ys, 1, true)
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + 8, ys, 1, true)
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + 12, ys, 1, true)
+                        filter246(this.u_plane, 8, level, ilevel, hlevel, ci + 4, cs, 1, true)
+                        filter246(this.v_plane, 8, level, ilevel, hlevel, ci + 4, cs, 1, true)
+                    }
+                    if mby > 0 {
+                        filter246(this.y_plane, 16, level + 4, ilevel, hlevel, yi, 1, ys, false)
+                        filter246(this.u_plane, 8, level + 4, ilevel, hlevel, ci, 1, cs, false)
+                        filter246(this.v_plane, 8, level + 4, ilevel, hlevel, ci, 1, cs, false)
+                    }
+                    if inner {
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + ys * 4, 1, ys, true)
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + ys * 8, 1, ys, true)
+                        filter246(this.y_plane, 16, level, ilevel, hlevel, yi + ys * 12, 1, ys, true)
+                        filter246(this.u_plane, 8, level, ilevel, hlevel, ci + cs * 4, 1, cs, true)
+                        filter246(this.v_plane, 8, level, ilevel, hlevel, ci + cs * 4, 1, cs, true)
+                    }
+                }
+                mbx++
+            }
+            mby++
+        }
+    }
+}
+
+fn clip_index(value: int, most: int) uint {
+    if value < 0 : return 0
+    if value > most : return most.to(uint)
+    return value.to(uint)
+}
+
+fn clip_pixel(value: int) u8 {
+    if value < 0 : return 0
+    if value > 255 : return 255
+    return value.to(u8)
+}
+
+fn avg2(a: int, b: int) u8 {
+    return ((a + b + 1) / 2).to(u8)
+}
+
+fn avg3(a: int, b: int, c: int) u8 {
+    return ((a + 2 * b + c + 2) / 4).to(u8)
+}
+
+fn fill4(out: local mut &[u8], values: local &[u8]) {
+    mem.copy(values, out)
+}
+
+// DC prediction at the picture edges averages only the border that exists
+fn edge_mode(mbx: uint, mby: uint, mode: uint) uint {
+    if mode != PRED_DC : return mode
+    if mbx == 0 : return mby == 0 ? PRED_DC_TOP_LEFT : PRED_DC_LEFT
+    return mby == 0 ? PRED_DC_TOP : PRED_DC
+}
+
+fn clamp_s8(value: int) int {
+    if value < -128 : return -128
+    if value > 127 : return 127
+    return value
+}
+
+fn clamp_s4(value: int) int {
+    if value < -16 : return -16
+    if value > 15 : return 15
+    return value
+}
+
+// The simple loop filter: 16 positions along an edge, two samples each side
+fn filter2(pix: local mut &[u8], level: int, start: uint, i_step: uint, j_step: uint) {
+    let index = start
+    let n: uint = 16
+    while n > 0 {
+        let p1 = pix[index - 2 * j_step].to(int)
+        let p0 = pix[index - j_step].to(int)
+        let q0 = pix[index].to(int)
+        let q1 = pix[index + j_step].to(int)
+        if (abs_int(p0 - q0) << 1) + (abs_int(p1 - q1) >> 1) <= level {
+            let a = 3 * (q0 - p0) + clamp_s8(p1 - q1)
+            let a1 = clamp_s4((a + 4) >> 3)
+            let a2 = clamp_s4((a + 3) >> 3)
+            pix[index - j_step] = clip_pixel(p0 + a2)
+            pix[index] = clip_pixel(q0 - a1)
+        }
+        index += i_step
+        n--
+    }
+}
+
+// The normal loop filter: up to three samples each side, milder inside a macroblock
+fn filter246(pix: local mut &[u8], count: uint, level: int, ilevel: int, hlevel: int, start: uint, i_step: uint, j_step: uint, four_not_six: bool) {
+    let index = start
+    let n = count
+    while n > 0 {
+        let p3 = pix[index - 4 * j_step].to(int)
+        let p2 = pix[index - 3 * j_step].to(int)
+        let p1 = pix[index - 2 * j_step].to(int)
+        let p0 = pix[index - j_step].to(int)
+        let q0 = pix[index].to(int)
+        let q1 = pix[index + j_step].to(int)
+        let q2 = pix[index + 2 * j_step].to(int)
+        let q3 = pix[index + 3 * j_step].to(int)
+        let skip = (abs_int(p0 - q0) << 1) + (abs_int(p1 - q1) >> 1) > level
+            || abs_int(p3 - p2) > ilevel || abs_int(p2 - p1) > ilevel || abs_int(p1 - p0) > ilevel
+            || abs_int(q1 - q0) > ilevel || abs_int(q2 - q1) > ilevel || abs_int(q3 - q2) > ilevel
+        if !skip {
+            if abs_int(p1 - p0) > hlevel || abs_int(q1 - q0) > hlevel {
+                let a = 3 * (q0 - p0) + clamp_s8(p1 - q1)
+                let a1 = clamp_s4((a + 4) >> 3)
+                let a2 = clamp_s4((a + 3) >> 3)
+                pix[index - j_step] = clip_pixel(p0 + a2)
+                pix[index] = clip_pixel(q0 - a1)
+            } else if four_not_six {
+                let a = 3 * (q0 - p0)
+                let a1 = clamp_s4((a + 4) >> 3)
+                let a2 = clamp_s4((a + 3) >> 3)
+                let a3 = (a1 + 1) >> 1
+                pix[index - 2 * j_step] = clip_pixel(p1 + a3)
+                pix[index - j_step] = clip_pixel(p0 + a2)
+                pix[index] = clip_pixel(q0 - a1)
+                pix[index + j_step] = clip_pixel(q1 - a3)
+            } else {
+                let a = clamp_s8(3 * (q0 - p0) + clamp_s8(p1 - q1))
+                let a1 = (27 * a + 63) >> 7
+                let a2 = (18 * a + 63) >> 7
+                let a3 = (9 * a + 63) >> 7
+                pix[index - 3 * j_step] = clip_pixel(p2 + a3)
+                pix[index - 2 * j_step] = clip_pixel(p1 + a2)
+                pix[index - j_step] = clip_pixel(p0 + a1)
+                pix[index] = clip_pixel(q0 - a1)
+                pix[index + j_step] = clip_pixel(q1 - a2)
+                pix[index + 2 * j_step] = clip_pixel(q2 - a3)
+            }
+        }
+        index += i_step
+        n--
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// From planes to pixels
+
+fn decode_vp8(data: local &[u8], alpha_chunk: ?String, has_alpha: bool) Image !ImageError {
+    let bytes = [u8]{ 0 x data.length }
+    mem.copy(data, bytes)
+    let decoder = Vp8Decoder{ data: bytes }
+    decoder.decode() !>
+    let width = decoder.width
+    let height = decoder.height
+    let with_alpha = has_alpha && isset(alpha_chunk)
+    let image = Image.new(width, height, with_alpha ? 4 : 3) !>
+    // Chroma is stored at half resolution; bring it up bilinearly like libwebp's
+    // "fancy" upsampler
+    let cw = (width + 1) / 2
+    let ch = (height + 1) / 2
+    let u = upsample_plane(decoder.u_plane, decoder.c_stride, cw, ch, width, height)
+    let v = upsample_plane(decoder.v_plane, decoder.c_stride, cw, ch, width, height)
+    let c = image.channels.to(uint)
+    let pixels = image.pixels
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let luma = decoder.y_plane[y * decoder.y_stride + x].to(int)
+            let cb = u[y * width + x].to(int)
+            let cr = v[y * width + x].to(int)
+            let at = (y * width + x) * c
+            // BT.601 with the 16..235 luma range, in libwebp's fixed point
+            let scaled = (luma * 19077) >> 8
+            pixels[at] = clip_pixel((scaled + ((cr * 26149) >> 8) - 14234) >> 6)
+            pixels[at + 1] = clip_pixel((scaled - ((cb * 6419) >> 8) - ((cr * 13320) >> 8) + 8708) >> 6)
+            pixels[at + 2] = clip_pixel((scaled + ((cb * 33050) >> 8) - 17685) >> 6)
+            x++
+        }
+        y++
+    }
+    if with_alpha : decode_alpha(alpha_chunk ?? "", image) !>
+    return image
+}
+
+fn upsample_plane(plane: local &[u8], stride: uint, pw: uint, ph: uint, width: uint, height: uint) mut &[u8] {
+    let out = [u8]{ 0 x width * height }
+    let xs = sample_positions(width, pw, 1, 2)
+    let ys = sample_positions(height, ph, 1, 2)
+    let y: uint = 0
+    while y < height {
+        let y0 = ys[y * 2]
+        let fy = ys[y * 2 + 1]
+        let y1 = y0 + 1 < ph ? y0 + 1 : y0
+        let x: uint = 0
+        while x < width {
+            let x0 = xs[x * 2]
+            let fx = xs[x * 2 + 1]
+            let x1 = x0 + 1 < pw ? x0 + 1 : x0
+            let top = plane[y0 * stride + x0].to(uint) * (256 - fx) + plane[y0 * stride + x1].to(uint) * fx
+            let bottom = plane[y1 * stride + x0].to(uint) * (256 - fx) + plane[y1 * stride + x1].to(uint) * fx
+            out[y * width + x] = ((top * (256 - fy) + bottom * fy + 32768) >> 16).to(u8)
+            x++
+        }
+        y++
+    }
+    return out
+}
+
+// The ALPH chunk: raw or losslessly compressed alpha samples, optionally predicted
+// from their neighbors
+fn decode_alpha(chunk: String, image: Image) !ImageError {
+    if chunk.bytes < 1 : throw .invalid { message: "Empty alpha chunk" }
+    let header = chunk[0].to(uint)
+    let compression = header & 3
+    let filter = (header >> 2) & 3
+    let width = image.width
+    let height = image.height
+    let alpha = [u8]{ 0 x width * height }
+    if compression == 0 {
+        if chunk.bytes < 1 + width * height : throw .invalid { message: "Truncated alpha data" }
+        mem.copy(chunk.view(1, width * height), alpha)
+    } else if compression == 1 {
+        // A VP8L image stream without its header; the green channel carries alpha
+        let bytes = [u8]{ 0 x chunk.bytes - 1 }
+        mem.copy(chunk.view(1, chunk.bytes - 1), bytes)
+        let decoder = LlDecoder{ data: bytes }
+        let pixels = decoder.read_image(width, height) !>
+        let i: uint = 0
+        while i < alpha.length {
+            alpha[i] = ((pixels[i] >> 8) & 0xff).to(u8)
+            i++
+        }
+    } else {
+        throw .invalid { message: "Unknown alpha compression" }
+    }
+    if filter != 0 {
+        let y: uint = 0
+        while y < height {
+            let x: uint = 0
+            while x < width {
+                let at = y * width + x
+                let predicted: uint = 0
+                if x == 0 && y == 0 : predicted = 0
+                else if y == 0 : predicted = alpha[at - 1].to(uint)
+                else if x == 0 : predicted = alpha[at - width].to(uint)
+                else if filter == 1 : predicted = alpha[at - 1].to(uint)
+                else if filter == 2 : predicted = alpha[at - width].to(uint)
+                else {
+                    let left = alpha[at - 1].to(int)
+                    let top = alpha[at - width].to(int)
+                    let corner = alpha[at - width - 1].to(int)
+                    predicted = clip_pixel(left + top - corner).to(uint)
+                }
+                alpha[at] = ((predicted + alpha[at].to(uint)) & 0xff).to(u8)
+                x++
+            }
+            y++
+        }
+    }
+    let pixels = image.pixels
+    let i: uint = 0
+    while i < alpha.length {
+        pixels[i * 4 + 3] = alpha[i]
+        i++
+    }
+}

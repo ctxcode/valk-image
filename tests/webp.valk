@@ -1,0 +1,55 @@
+use image
+use valk.mem
+
+// References are ImageMagick's (libwebp) decoding of the same files
+
+fn webp_matches(name: String) bool {
+    let data = asset("webp-" + name + ".webp")
+    assert(image.is_webp(data))
+    let ours = image.decode(data) !!
+    let ref = image.decode_png(asset("webp-" + name + "-ref.png")) !!
+    if ours.channels != ref.channels : ref = ours.channels == 4 ? ref.to_rgba() : ref.to_rgb()
+    return ours.width == ref.width && ours.height == ref.height && mem.equals(ours.pixels, ref.pixels)
+}
+
+test "WebP: lossless files decode exactly" {
+    let rgb = image.decode_webp(asset("webp-ll-rgb.webp")) !!
+    assert(rgb.width == 37 && rgb.height == 29 && rgb.channels == 3)
+    let rgba = image.decode_webp(asset("webp-ll-rgba.webp")) !!
+    assert(rgba.channels == 4)
+    // Color indexing (palette), subtract-green and predictor transforms, one pixel,
+    // and a two-color image packed eight pixels per byte
+    let names = Array[String]{ "ll-rgb", "ll-rgba", "ll-pal", "ll-gray", "ll-one", "ll-bilevel" }
+    each names as name : assert(webp_matches(name))
+}
+
+test "WebP: lossy files decode exactly like libwebp" {
+    // Normal and simple loop filters, none at all, several partitions, low quality,
+    // gray input, one pixel
+    let names = Array[String]{ "lossy-rgb", "lossy-q30", "lossy-nofilter", "lossy-simple", "lossy-parts", "lossy-gray", "lossy-one" }
+    each names as name : assert(webp_matches(name))
+    let one = image.decode_webp(asset("webp-lossy-one.webp")) !!
+    assert(one.width == 1 && one.height == 1 && one.channels == 3)
+}
+
+test "WebP: lossy files with an alpha plane" {
+    // Lossless-compressed alpha, raw alpha, and the horizontal and gradient filters
+    let names = Array[String]{ "lossy-rgba", "lossy-alpha-raw", "lossy-alpha-f2", "lossy-alpha-filt3" }
+    each names as name : assert(webp_matches(name))
+    let rgba = image.decode_webp(asset("webp-lossy-rgba.webp")) !!
+    assert(rgba.channels == 4 && rgba.get(0, 0, 3) == 102)
+}
+
+test "WebP: unsupported and malformed files are reported" {
+    image.decode_webp(asset("webp-anim.webp")) ! {
+        assert(E.code == E.unsupported)
+        assert(E.message.contains("Animated"))
+    }
+    let data = asset("webp-lossy-rgb.webp")
+    image.decode_webp(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)
+    let lossless = asset("webp-ll-rgb.webp")
+    image.decode_webp(lossless.range(0, lossless.bytes - 40)) ! assert(E.code == E.invalid)
+    image.decode_webp("RIFF\x00\x00\x00\x00WEBP") ! assert(E.code == E.invalid)
+    image.decode_webp("not webp") ! assert(E.code == E.invalid)
+    assert(!image.is_webp("RIFF"))
+}

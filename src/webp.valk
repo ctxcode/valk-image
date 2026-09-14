@@ -1,0 +1,669 @@
+use valk.mem
+
+// WebP: the RIFF container with its simple (VP8 / VP8L) and extended (VP8X) layouts,
+// and the lossless VP8L bitstream: LZ77 back references and a color cache under
+// canonical Huffman codes, undone by up to four reversible transforms.
+
+/// Whether `data` starts like a WebP file.
++ fn is_webp(data: local &[u8]) bool {
+    return data.length >= 12 && mem.equals(data.view(0, 4), "RIFF") && mem.equals(data.view(8, 4), "WEBP")
+}
+
+/// Decodes a WebP image.
+///
+/// Lossless files decode exactly; lossy files (VP8) are decoded with their optional
+/// alpha plane. The image has 4 channels when the file declares an alpha channel,
+/// 3 otherwise. Animated files throw `unsupported`; malformed files throw `invalid`.
++ fn decode_webp(data: local &[u8]) Image !ImageError {
+    if !is_webp(data) : throw .invalid { message: "Not a WebP file" }
+    let riff_size = read_u32_le(data, 4).to(uint)
+    let end = riff_size + 8 < data.length ? riff_size + 8 : data.length
+    let pos: uint = 12
+    let alpha_chunk: ?String = null
+    let has_alpha_flag = false
+    while pos + 8 <= end {
+        let fourcc = data.view(pos, 4)
+        let size = read_u32_le(data, pos + 4).to(uint)
+        if pos + 8 + size > end : throw .invalid { message: "Truncated WebP chunk" }
+        let body = data.view(pos + 8, size)
+        if mem.equals(fourcc, "VP8L") {
+            return decode_vp8l(body) !>
+        } else if mem.equals(fourcc, "VP8 ") {
+            return decode_vp8(body, alpha_chunk, has_alpha_flag) !>
+        } else if mem.equals(fourcc, "VP8X") {
+            if size < 10 : throw .invalid { message: "Bad VP8X chunk" }
+            if (body[0] & 0x02) != 0 : throw .unsupported { message: "Animated WebP" }
+            has_alpha_flag = (body[0] & 0x10) != 0
+        } else if mem.equals(fourcc, "ALPH") {
+            alpha_chunk = body.to_string()
+        } else if mem.equals(fourcc, "ANIM") || mem.equals(fourcc, "ANMF") {
+            throw .unsupported { message: "Animated WebP" }
+        }
+        // ICCP, EXIF, XMP and unknown chunks are skipped; chunks are padded to even sizes
+        pos += 8 + size + (size % 2)
+    }
+    throw .invalid { message: "WebP without image data" }
+}
+
+// ---------------------------------------------------------------------------------------
+// VP8L (lossless)
+
+value VP8L_SIGNATURE (0x2f)
+// The green alphabet: 256 literals, 24 length prefix codes, then the color cache
+value GREEN_LITERALS (256)
+value LENGTH_CODES (24)
+value DISTANCE_CODES (40)
+
+// The order in which the code length code lengths are stored
+global code_length_order: Array[u8] (Array[u8]{ 17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 })
+
+// Short distance codes name a nearby pixel by (dx, dy) instead of a linear distance
+global distance_map: Array[i8] (Array[i8]{
+    0, 1, 1, 0, 1, 1, -1, 1, 0, 2, 2, 0, 1, 2, -1, 2,
+    2, 1, -2, 1, 2, 2, -2, 2, 0, 3, 3, 0, 1, 3, -1, 3,
+    3, 1, -3, 1, 2, 3, -2, 3, 3, 2, -3, 2, 0, 4, 4, 0,
+    1, 4, -1, 4, 4, 1, -4, 1, 3, 3, -3, 3, 2, 4, -2, 4,
+    4, 2, -4, 2, 0, 5, 3, 4, -3, 4, 4, 3, -4, 3, 5, 0,
+    1, 5, -1, 5, 5, 1, -5, 1, 2, 5, -2, 5, 5, 2, -5, 2,
+    4, 4, -4, 4, 3, 5, -3, 5, 5, 3, -5, 3, 0, 6, 6, 0,
+    1, 6, -1, 6, 6, 1, -6, 1, 2, 6, -2, 6, 6, 2, -6, 2,
+    4, 5, -4, 5, 5, 4, -5, 4, 3, 6, -3, 6, 6, 3, -6, 3,
+    0, 7, 7, 0, 1, 7, -1, 7, 5, 5, -5, 5, 7, 1, -7, 1,
+    4, 6, -4, 6, 6, 4, -6, 4, 2, 7, -2, 7, 7, 2, -7, 2,
+    3, 7, -3, 7, 7, 3, -7, 3, 5, 6, -5, 6, 6, 5, -6, 5,
+    8, 0, 4, 7, -4, 7, 7, 4, -7, 4, 8, 1, 8, 2, 6, 6,
+    -6, 6, 8, 3, 5, 7, -5, 7, 7, 5, -7, 5, 8, 4, 6, 7,
+    -6, 7, 7, 6, -7, 6, 8, 5, 7, 7, -7, 7, 8, 6, 8, 7,
+})
+
+// A canonical Huffman code read least-significant bit first: a lookup on the next 8
+// bits for the short codes, a walk by length for the rest
+class LlCode {
+    fast: mut &[u32] ([u32]{ 0 x 256 })
+    counts: mut &[uint] ([uint]{ 0 x 16 })
+    symbols: mut &[u16] ([u16]{ 0 x 0 })
+    // The one symbol of a code that uses no bits, or -1
+    single: int (-1)
+
+    static fn build(lengths: local &[u8]) SELF !ImageError {
+        let code = SELF{}
+        let used: uint = 0
+        let last: uint = 0
+        let i: uint = 0
+        while i < lengths.length {
+            let l = lengths[i].to(uint)
+            if l > 15 : throw .invalid { message: "Bad Huffman code length" }
+            if l > 0 {
+                code.counts[l]++
+                used++
+                last = i
+            }
+            i++
+        }
+        if used == 0 : throw .invalid { message: "Empty Huffman code" }
+        if used == 1 {
+            code.single = last.to(int)
+            return code
+        }
+        // Kraft check: the lengths must fill the code exactly
+        let left: int = 1
+        let l: uint = 1
+        while l <= 15 {
+            left = left * 2 - code.counts[l].to(int)
+            if left < 0 : throw .invalid { message: "Over-subscribed Huffman code" }
+            l++
+        }
+        if left != 0 : throw .invalid { message: "Incomplete Huffman code" }
+        // Symbols in code order, and the fast table from their canonical codes
+        let offsets = [uint]{ 0 x 17 }
+        l = 1
+        while l < 16 {
+            offsets[l + 1] = offsets[l] + code.counts[l]
+            l++
+        }
+        code.symbols = [u16]{ 0 x used }
+        let next_code = [uint]{ 0 x 16 }
+        let first: uint = 0
+        l = 1
+        while l <= 15 {
+            next_code[l] = first
+            first = (first + code.counts[l]) << 1
+            l++
+        }
+        i = 0
+        while i < lengths.length {
+            let len = lengths[i].to(uint)
+            if len > 0 {
+                code.symbols[offsets[len]] = i.to(u16)
+                offsets[len]++
+                let canonical = next_code[len]
+                next_code[len]++
+                if len <= 8 {
+                    let reversed = reverse_bits(canonical, len)
+                    let step: uint = 1 << len
+                    let at = reversed
+                    while at < 256 {
+                        code.fast[at] = ((len << 16) | i).to(u32)
+                        at += step
+                    }
+                }
+            }
+            i++
+        }
+        return code
+    }
+}
+
+fn reverse_bits(value: uint, count: uint) uint {
+    let out: uint = 0
+    let i: uint = 0
+    while i < count {
+        out = (out << 1) | ((value >> i) & 1)
+        i++
+    }
+    return out
+}
+
+// The five codes of one entropy group
+class LlGroup {
+    green: LlCode
+    red: LlCode
+    blue: LlCode
+    alpha: LlCode
+    distance: LlCode
+}
+
+class LlTransform {
+    type: uint
+    size_bits: uint (0)
+    // PREDICTOR and COLOR: one pixel per block; COLOR_INDEXING: the palette
+    data: mut &[uint] ([uint]{ 0 x 0 })
+    // COLOR_INDEXING: pixels per byte is 1 << width_bits
+    width_bits: uint (0)
+}
+
+value TRANSFORM_PREDICTOR (0)
+value TRANSFORM_COLOR (1)
+value TRANSFORM_SUBTRACT_GREEN (2)
+value TRANSFORM_COLOR_INDEXING (3)
+
+class LlDecoder {
+    data: mut &[u8]
+    pos: uint (0)
+    acc: uint (0)
+    acc_bits: uint (0)
+    overrun: bool (false)
+
+    // Least significant bit first
+    fn fill() {
+        while this.acc_bits <= 56 {
+            let byte: uint = 0
+            if this.pos < this.data.length {
+                byte = this.data[this.pos].to(uint)
+                this.pos++
+            } else if this.acc_bits == 0 {
+                this.overrun = true
+            }
+            this.acc = this.acc | (byte << this.acc_bits)
+            this.acc_bits += 8
+        }
+    }
+
+    fn read_bits(count: uint) uint {
+        if count == 0 : return 0
+        if this.acc_bits < count : this.fill()
+        let value = this.acc & ((1 << count) - 1)
+        this.acc = this.acc >> count
+        this.acc_bits -= count
+        return value
+    }
+
+    fn read_symbol(code: LlCode) uint !ImageError {
+        if code.single >= 0 : return code.single.to(uint)
+        if this.acc_bits < 16 : this.fill()
+        let entry = code.fast[this.acc & 255].to(uint)
+        if entry != 0 {
+            let len = entry >> 16
+            this.acc = this.acc >> len
+            this.acc_bits -= len
+            return entry & 0xffff
+        }
+        // Longer than 8 bits: walk the canonical code one bit at a time
+        let value: uint = 0
+        let first: uint = 0
+        let index: uint = 0
+        let len: uint = 1
+        while len <= 15 {
+            value = value | this.read_bits(1)
+            let count = code.counts[len]
+            if value < first + count : return code.symbols[index + value - first].to(uint)
+            index += count
+            first = (first + count) << 1
+            value = value << 1
+            len++
+        }
+        throw .invalid { message: "Bad Huffman code" }
+    }
+
+    fn read_code(alphabet_size: uint) LlCode !ImageError {
+        let lengths = [u8]{ 0 x alphabet_size }
+        if this.read_bits(1) == 1 {
+            // One or two symbols spelled out
+            let count = this.read_bits(1) + 1
+            let first_bits: uint = this.read_bits(1) == 1 ? 8 : 1
+            let first = this.read_bits(first_bits)
+            if first >= alphabet_size : throw .invalid { message: "Huffman symbol outside the alphabet" }
+            lengths[first] = 1
+            if count == 2 {
+                let second = this.read_bits(8)
+                if second >= alphabet_size : throw .invalid { message: "Huffman symbol outside the alphabet" }
+                lengths[second] = 1
+            }
+            return LlCode.build(lengths) !>
+        }
+        // Code lengths are themselves Huffman coded
+        let length_lengths = [u8]{ 0 x 19 }
+        let count = this.read_bits(4) + 4
+        let i: uint = 0
+        while i < count {
+            length_lengths[code_length_order[i].to(uint)] = this.read_bits(3).to(u8)
+            i++
+        }
+        let length_code = LlCode.build(length_lengths) !>
+        let max_symbol = alphabet_size
+        if this.read_bits(1) == 1 {
+            let length_bits = 2 + 2 * this.read_bits(3)
+            max_symbol = 2 + this.read_bits(length_bits)
+            if max_symbol > alphabet_size : throw .invalid { message: "Bad Huffman code length count" }
+        }
+        let symbol: uint = 0
+        let previous: u8 = 8
+        while symbol < alphabet_size {
+            if max_symbol == 0 : break
+            max_symbol--
+            let code_length = this.read_symbol(length_code) !>
+            if code_length < 16 {
+                lengths[symbol] = code_length.to(u8)
+                symbol++
+                if code_length != 0 : previous = code_length.to(u8)
+            } else {
+                let repeat_value: u8 = code_length == 16 ? previous : 0
+                let extra: uint = code_length == 16 ? 2 : (code_length == 17 ? 3 : 7)
+                let base: uint = code_length == 18 ? 11 : 3
+                let repeat = base + this.read_bits(extra)
+                if symbol + repeat > alphabet_size : throw .invalid { message: "Huffman code lengths overflow the alphabet" }
+                let r: uint = 0
+                while r < repeat {
+                    lengths[symbol++] = repeat_value
+                    r++
+                }
+            }
+        }
+        return LlCode.build(lengths) !>
+    }
+
+    fn read_group(cache_bits: uint) LlGroup !ImageError {
+        let cache_size: uint = cache_bits > 0 ? (1 << cache_bits) : 0
+        return LlGroup {
+            green: this.read_code(GREEN_LITERALS + LENGTH_CODES + cache_size) !>
+            red: this.read_code(256) !>
+            blue: this.read_code(256) !>
+            alpha: this.read_code(256) !>
+            distance: this.read_code(DISTANCE_CODES) !>
+        }
+    }
+
+    // An entropy-coded image of ARGB pixels: the main picture (with transforms and
+    // meta codes already read by the caller) or one of the small helper images
+    fn read_pixels(width: uint, height: uint, is_main: bool) mut &[uint] !ImageError {
+        let cache_bits: uint = 0
+        if this.read_bits(1) == 1 {
+            cache_bits = this.read_bits(4)
+            if cache_bits < 1 || cache_bits > 11 : throw .invalid { message: "Bad color cache size" }
+        }
+        // The main image may pick its entropy group per block from a meta image
+        let meta: ?mut &[uint] = null
+        let meta_bits: uint = 0
+        let meta_width: uint = 0
+        let groups = Array[LlGroup]{}
+        if is_main && this.read_bits(1) == 1 {
+            meta_bits = this.read_bits(3) + 2
+            meta_width = (width + (1 << meta_bits) - 1) >> meta_bits
+            let meta_height = (height + (1 << meta_bits) - 1) >> meta_bits
+            let image = this.read_pixels(meta_width, meta_height, false) !>
+            let largest: uint = 0
+            let i: uint = 0
+            while i < image.length {
+                let group = (image[i] >> 8) & 0xffff
+                image[i] = group
+                if group > largest : largest = group
+                i++
+            }
+            meta = image
+            let g: uint = 0
+            while g <= largest {
+                groups.append(this.read_group(cache_bits) !>)
+                g++
+            }
+        } else {
+            groups.append(this.read_group(cache_bits) !>)
+        }
+
+        let cache = [uint]{ 0 x (cache_bits > 0 ? (1 << cache_bits) : 1) }
+        let total = width * height
+        let pixels = [uint]{ 0 x total }
+        let group = groups[0]
+        let pos: uint = 0
+        while pos < total {
+            if isset(meta) {
+                let x = pos % width
+                let y = pos / width
+                group = groups[meta[(y >> meta_bits) * meta_width + (x >> meta_bits)]]
+            }
+            let code = this.read_symbol(group.green) !>
+            if code < GREEN_LITERALS {
+                let red = this.read_symbol(group.red) !>
+                let blue = this.read_symbol(group.blue) !>
+                let alpha = this.read_symbol(group.alpha) !>
+                let argb = (alpha << 24) | (red << 16) | (code << 8) | blue
+                pixels[pos] = argb
+                if cache_bits > 0 : cache[cache_hash(argb, cache_bits)] = argb
+                pos++
+            } else if code < GREEN_LITERALS + LENGTH_CODES {
+                let length = this.read_prefixed(code - GREEN_LITERALS)
+                let distance_symbol = this.read_symbol(group.distance) !>
+                let distance_code = this.read_prefixed(distance_symbol)
+                let distance = plane_distance(distance_code, width)
+                if distance > pos || pos + length > total : throw .invalid { message: "Back reference outside the image" }
+                let i: uint = 0
+                while i < length {
+                    let argb = pixels[pos - distance]
+                    pixels[pos] = argb
+                    if cache_bits > 0 : cache[cache_hash(argb, cache_bits)] = argb
+                    pos++
+                    i++
+                }
+            } else {
+                let index = code - GREEN_LITERALS - LENGTH_CODES
+                if cache_bits == 0 || index >= cache.length : throw .invalid { message: "Color cache index without a cache" }
+                let argb = cache[index]
+                pixels[pos] = argb
+                cache[cache_hash(argb, cache_bits)] = argb
+                pos++
+            }
+        }
+        if this.overrun : throw .invalid { message: "Lossless data ends early" }
+        return pixels
+    }
+
+    // A length or distance from its prefix code and extra bits
+    fn read_prefixed(prefix: uint) uint {
+        if prefix < 4 : return prefix + 1
+        let extra_bits = (prefix - 2) >> 1
+        let offset: uint = (2 + (prefix & 1)) << extra_bits
+        return offset + this.read_bits(extra_bits) + 1
+    }
+}
+
+fn cache_hash(argb: uint, bits: uint) uint {
+    return ((0x1e35a7bd * argb) & 0xffffffff) >> (32 - bits)
+}
+
+// Distance codes up to 120 name a pixel by offset in the plane
+fn plane_distance(code: uint, width: uint) uint {
+    if code > 120 : return code - 120
+    let dx = distance_map[(code - 1) * 2].to(int)
+    let dy = distance_map[(code - 1) * 2 + 1].to(int)
+    let distance = dx + dy * width.to(int)
+    return distance < 1 ? 1 : distance.to(uint)
+}
+
+fn decode_vp8l(data: local &[u8]) Image !ImageError {
+    if data.length < 5 || data[0] != VP8L_SIGNATURE : throw .invalid { message: "Bad VP8L header" }
+    let bytes = [u8]{ 0 x data.length - 1 }
+    mem.copy(data.view(1, data.length - 1), bytes)
+    let decoder = LlDecoder{ data: bytes }
+    let width = decoder.read_bits(14) + 1
+    let height = decoder.read_bits(14) + 1
+    let has_alpha = decoder.read_bits(1) == 1
+    if decoder.read_bits(3) != 0 : throw .invalid { message: "Unknown VP8L version" }
+    if width * height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+    let pixels = decoder.read_image(width, height) !>
+    return argb_to_image(pixels, width, height, has_alpha ? 4 : 3) !>
+}
+
+extend LlDecoder {
+    // A full picture: its transforms, then the pixels, then the transforms undone
+    fn read_image(width: uint, height: uint) mut &[uint] !ImageError {
+        let transforms = Array[LlTransform]{}
+        let coded_width = width
+        let seen: uint = 0
+        while this.read_bits(1) == 1 {
+            let type = this.read_bits(2)
+            if (seen & (1 << type)) != 0 : throw .invalid { message: "Repeated VP8L transform" }
+            seen = seen | (1 << type)
+            let transform = LlTransform{ type: type }
+            if type == TRANSFORM_PREDICTOR || type == TRANSFORM_COLOR {
+                transform.size_bits = this.read_bits(3) + 2
+                let block_width = (coded_width + (1 << transform.size_bits) - 1) >> transform.size_bits
+                let block_height = (height + (1 << transform.size_bits) - 1) >> transform.size_bits
+                transform.data = this.read_pixels(block_width, block_height, false) !>
+            } else if type == TRANSFORM_COLOR_INDEXING {
+                let colors = this.read_bits(8) + 1
+                let palette = this.read_pixels(colors, 1, false) !>
+                // Entries are stored as differences from the previous one, per channel
+                let i: uint = 1
+                while i < colors {
+                    palette[i] = add_channels(palette[i], palette[i - 1])
+                    i++
+                }
+                transform.data = palette
+                transform.width_bits = colors <= 2 ? 3 : (colors <= 4 ? 2 : (colors <= 16 ? 1 : 0))
+                coded_width = (coded_width + (1 << transform.width_bits) - 1) >> transform.width_bits
+            }
+            transforms.append(transform)
+        }
+        let pixels = this.read_pixels(coded_width, height, true) !>
+        // Undo in reverse order; each transform sees the width the next one produced
+        let i = transforms.length
+        while i > 0 {
+            i--
+            let transform = transforms[i]
+            if transform.type == TRANSFORM_COLOR_INDEXING {
+                pixels = expand_palette(pixels, transform, coded_width, width, height)
+                coded_width = width
+            } else if transform.type == TRANSFORM_SUBTRACT_GREEN {
+                add_green(pixels)
+            } else if transform.type == TRANSFORM_COLOR {
+                undo_color_transform(pixels, transform, coded_width, height)
+            } else {
+                undo_predictor(pixels, transform, coded_width, height)
+            }
+        }
+        return pixels
+    }
+}
+
+fn add_channels(a: uint, b: uint) uint {
+    return (((a & 0xff00ff00) + (b & 0xff00ff00)) & 0xff00ff00) | (((a & 0x00ff00ff) + (b & 0x00ff00ff)) & 0x00ff00ff)
+}
+
+fn average2(a: uint, b: uint) uint {
+    return (((a ^ b) & 0xfefefefe) >> 1) + (a & b)
+}
+
+fn expand_palette(packed: mut &[uint], transform: LlTransform, packed_width: uint, width: uint, height: uint) mut &[uint] {
+    let palette = transform.data
+    let bits = transform.width_bits
+    let per_pixel: uint = 8 >> bits
+    let mask: uint = (1 << per_pixel) - 1
+    let out = [uint]{ 0 x width * height }
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let packed_pixel = packed[y * packed_width + (x >> bits)]
+            let shift = (x & ((1 << bits) - 1)) * per_pixel
+            let index = ((packed_pixel >> 8) >> shift) & mask
+            // An index past the palette is transparent black
+            out[y * width + x] = index < palette.length ? palette[index] : 0
+            x++
+        }
+        y++
+    }
+    return out
+}
+
+fn add_green(pixels: local mut &[uint]) {
+    let i: uint = 0
+    while i < pixels.length {
+        let argb = pixels[i]
+        let green = (argb >> 8) & 0xff
+        let red = (((argb >> 16) & 0xff) + green) & 0xff
+        let blue = ((argb & 0xff) + green) & 0xff
+        pixels[i] = (argb & 0xff00ff00) | (red << 16) | blue
+        i++
+    }
+}
+
+// A signed 8-bit multiplier times a signed 8-bit channel, scaled down
+fn color_delta(multiplier: uint, channel: uint) int {
+    let m = multiplier.to(u8).to(i8).to(int)
+    let c = channel.to(u8).to(i8).to(int)
+    return (m * c) >> 5
+}
+
+fn undo_color_transform(pixels: local mut &[uint], transform: LlTransform, width: uint, height: uint) {
+    let bits = transform.size_bits
+    let blocks_per_row = (width + (1 << bits) - 1) >> bits
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let element = transform.data[(y >> bits) * blocks_per_row + (x >> bits)]
+            let green_to_red = element & 0xff
+            let green_to_blue = (element >> 8) & 0xff
+            let red_to_blue = (element >> 16) & 0xff
+            let argb = pixels[y * width + x]
+            let green = (argb >> 8) & 0xff
+            let red = (((argb >> 16) & 0xff).to(int) + color_delta(green_to_red, green)) & 0xff
+            let blue = ((argb & 0xff).to(int) + color_delta(green_to_blue, green) + color_delta(red_to_blue, red.to(uint))) & 0xff
+            pixels[y * width + x] = (argb & 0xff00ff00) | (red.to(uint) << 16) | blue.to(uint)
+            x++
+        }
+        y++
+    }
+}
+
+fn undo_predictor(pixels: local mut &[uint], transform: LlTransform, width: uint, height: uint) {
+    let bits = transform.size_bits
+    let blocks_per_row = (width + (1 << bits) - 1) >> bits
+    // The first pixel predicts from opaque black, the rest of the first row from the
+    // left, the first column from above
+    pixels[0] = add_channels(pixels[0], 0xff000000)
+    let x: uint = 1
+    while x < width {
+        pixels[x] = add_channels(pixels[x], pixels[x - 1])
+        x++
+    }
+    let y: uint = 1
+    while y < height {
+        let row = y * width
+        pixels[row] = add_channels(pixels[row], pixels[row - width])
+        x = 1
+        while x < width {
+            let mode = (transform.data[(y >> bits) * blocks_per_row + (x >> bits)] >> 8) & 0xf
+            let at = row + x
+            let left = pixels[at - 1]
+            let top = pixels[at - width]
+            let top_left = pixels[at - width - 1]
+            // For the last column this is the first pixel of the current row
+            let top_right = pixels[at - width + 1]
+            let predicted: uint = 0
+            if mode == 0 : predicted = 0xff000000
+            else if mode == 1 : predicted = left
+            else if mode == 2 : predicted = top
+            else if mode == 3 : predicted = top_right
+            else if mode == 4 : predicted = top_left
+            else if mode == 5 : predicted = average2(average2(left, top_right), top)
+            else if mode == 6 : predicted = average2(left, top_left)
+            else if mode == 7 : predicted = average2(left, top)
+            else if mode == 8 : predicted = average2(top_left, top)
+            else if mode == 9 : predicted = average2(top, top_right)
+            else if mode == 10 : predicted = average2(average2(left, top_left), average2(top, top_right))
+            else if mode == 11 : predicted = select_predictor(left, top, top_left)
+            else if mode == 12 : predicted = clamp_add_subtract_full(left, top, top_left)
+            else if mode == 13 : predicted = clamp_add_subtract_half(average2(left, top), top_left)
+            else : predicted = 0xff000000
+            pixels[at] = add_channels(pixels[at], predicted)
+            x++
+        }
+        y++
+    }
+}
+
+fn channel(argb: uint, shift: uint) int {
+    return ((argb >> shift) & 0xff).to(int)
+}
+
+fn abs_diff(a: int, b: int) int {
+    return a > b ? a - b : b - a
+}
+
+// Picks left or top, whichever the gradient estimate is closer to
+fn select_predictor(left: uint, top: uint, top_left: uint) uint {
+    let to_left: int = 0
+    let to_top: int = 0
+    let shift: uint = 0
+    while shift < 32 {
+        let estimate = channel(left, shift) + channel(top, shift) - channel(top_left, shift)
+        to_left += abs_diff(estimate, channel(left, shift))
+        to_top += abs_diff(estimate, channel(top, shift))
+        shift += 8
+    }
+    return to_left < to_top ? left : top
+}
+
+fn clamp_channel(value: int) uint {
+    if value < 0 : return 0
+    if value > 255 : return 255
+    return value.to(uint)
+}
+
+fn clamp_add_subtract_full(a: uint, b: uint, c: uint) uint {
+    let out: uint = 0
+    let shift: uint = 0
+    while shift < 32 {
+        out = out | (clamp_channel(channel(a, shift) + channel(b, shift) - channel(c, shift)) << shift)
+        shift += 8
+    }
+    return out
+}
+
+fn clamp_add_subtract_half(a: uint, b: uint) uint {
+    let out: uint = 0
+    let shift: uint = 0
+    while shift < 32 {
+        let va = channel(a, shift)
+        out = out | (clamp_channel(va + (va - channel(b, shift)) / 2) << shift)
+        shift += 8
+    }
+    return out
+}
+
+fn argb_to_image(pixels: local &[uint], width: uint, height: uint, channels: u8) Image !ImageError {
+    let image = Image.new(width, height, channels) !>
+    let c = channels.to(uint)
+    let out = image.pixels
+    let i: uint = 0
+    while i < pixels.length {
+        let argb = pixels[i]
+        let at = i * c
+        out[at] = ((argb >> 16) & 0xff).to(u8)
+        out[at + 1] = ((argb >> 8) & 0xff).to(u8)
+        out[at + 2] = (argb & 0xff).to(u8)
+        if c == 4 : out[at + 3] = (argb >> 24).to(u8)
+        i++
+    }
+    return image
+}

@@ -31,7 +31,7 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 ## Functions for 'main'
 
 ```js
-// Decodes an image, recognizing the format from its first bytes: PNG, JPEG or BMP.
+// Decodes an image, recognizing the format from its first bytes: PNG, JPEG, WebP or BMP.
 + fn decode(data: local &[u8]) Image !ImageError
 // Decodes a Windows bitmap.
 + fn decode_bmp(data: local &[u8]) Image !ImageError
@@ -39,12 +39,16 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 + fn decode_jpeg(data: local &[u8]) Image !ImageError
 // Decodes a PNG image.
 + fn decode_png(data: local &[u8]) Image !ImageError
+// Decodes a WebP image.
++ fn decode_webp(data: local &[u8]) Image !ImageError
 // Whether `data` starts like a Windows bitmap.
 + fn is_bmp(data: local &[u8]) bool
 // Whether `data` starts with the JPEG marker sequence.
 + fn is_jpeg(data: local &[u8]) bool
 // Whether `data` starts with the PNG signature.
 + fn is_png(data: local &[u8]) bool
+// Whether `data` starts like a WebP file.
++ fn is_webp(data: local &[u8]) bool
 // Returns the EXIF orientation of a JPEG, 1 to 8, or 1 when the file has none.
 + fn jpeg_orientation(data: local &[u8]) uint
 // Reads and decodes the image file at `path`.
