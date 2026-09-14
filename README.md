@@ -33,6 +33,47 @@ fn main() {
 Every operation returns a new image. An `Image` holds only plain data, so it can be
 converted to `shared` and handed to another thread.
 
+## Example: a thumbnail service
+
+A small server that takes any PNG, JPEG or BMP as the request body and answers with a
+300x200 JPEG thumbnail. The three steps are decode, resize, encode; each one that can
+fail turns into a 400 with the reason.
+
+```valk
+use image
+use valk.http
+
+fn main() {
+    println("Thumbnail service on http://127.0.0.1:8080")
+    http.serve("127.0.0.1", 8080, thumbnail) ! panic("Cannot start the server")
+}
+
+fn thumbnail(req: http.Request) http.Response {
+    if req.method != "POST" : return http.Response.text("POST an image to get a thumbnail", 405)
+
+    // Sniffs the format from the first bytes
+    let photo = image.decode(req.body) ! return http.Response.text("Not an image: " + E.message, 400)
+
+    // Scale to fill 300x200 and crop the overflow evenly
+    let thumb = photo.cover(300, 200) ! return http.Response.text("Cannot resize: " + E.message, 400)
+
+    return http.Response.new(thumb.encode_jpeg(85), 200, "image/jpeg")
+}
+```
+
+Run it and post a picture:
+
+```sh
+$ valk build . --run &
+Thumbnail service on http://127.0.0.1:8080
+$ curl --data-binary @holiday.png http://127.0.0.1:8080/ -o thumb.jpg
+$ file thumb.jpg
+thumb.jpg: JPEG image data, JFIF standard 1.01, ... 300x200, components 3
+```
+
+A 5 MB photo takes about 150 ms end to end. For a browser form, `req.files()` gives
+the parts of a `multipart/form-data` upload instead of `req.body`.
+
 ## Install
 
 ```sh
