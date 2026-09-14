@@ -17,10 +17,28 @@ test "JPEG: baseline files decode within 2 levels of libjpeg" {
     assert(gray.channels == 1 && max_diff(gray, gray_ref) <= 1)
 }
 
+test "JPEG: progressive files decode within 2 levels of libjpeg" {
+    // cjpeg's default scan script: DC with successive approximation, spectral bands and
+    // refinement scans for every component, plus a restart-interval variant
+    let names = Array[String]{ "photo-progressive", "photo-progressive-444", "photo-progressive-restart" }
+    each names as name {
+        let ours = image.decode_jpeg(asset(name + ".jpg")) !!
+        let ref = image.decode_png(asset(name + "-ref.png")) !!
+        assert(ours.channels == 3 && max_diff(ours, ref) <= 2)
+    }
+    let gray = image.decode_jpeg(asset("photo-progressive-gray.jpg")) !!
+    let gray_ref = image.decode_png(asset("photo-progressive-gray-ref.png")) !!
+    assert(gray.channels == 1 && max_diff(gray, gray_ref) <= 1)
+
+    // A file cut off between scans is invalid, not a partial picture
+    let data = asset("photo-progressive.jpg")
+    image.decode_jpeg(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)
+}
+
 test "JPEG: unsupported and malformed files are reported" {
-    image.decode_jpeg(asset("photo-progressive.jpg")) ! {
+    image.decode_jpeg(asset("photo-arith.jpg")) ! {
         assert(E.code == E.unsupported)
-        assert(E.message.contains("Progressive"))
+        assert(E.message.contains("Arithmetic"))
     }
     let data = asset("photo-420.jpg")
     image.decode_jpeg(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)

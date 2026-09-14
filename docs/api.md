@@ -35,7 +35,7 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 + fn decode(data: local &[u8]) Image !ImageError
 // Decodes a Windows bitmap.
 + fn decode_bmp(data: local &[u8]) Image !ImageError
-// Decodes a baseline JPEG image.
+// Decodes a JPEG image.
 + fn decode_jpeg(data: local &[u8]) Image !ImageError
 // Decodes a PNG image.
 + fn decode_png(data: local &[u8]) Image !ImageError

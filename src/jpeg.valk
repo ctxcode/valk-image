@@ -22,11 +22,11 @@ value FAST_BITS (9)
     return data.length >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff
 }
 
-/// Decodes a baseline JPEG image.
+/// Decodes a JPEG image.
 ///
-/// Reads sequential Huffman-coded 8-bit files with one component (gray) or three (YCbCr,
-/// or RGB when an Adobe marker says so), any chroma sampling factors and restart
-/// intervals. Subsampled chroma is upsampled bilinearly. Progressive, arithmetic-coded,
+/// Reads baseline and progressive Huffman-coded 8-bit files with one component (gray) or
+/// three (YCbCr, or RGB when an Adobe marker says so), any chroma sampling factors and
+/// restart intervals. Subsampled chroma is upsampled bilinearly. Arithmetic-coded,
 /// lossless, 12-bit and CMYK files throw `unsupported`; malformed files throw `invalid`.
 + fn decode_jpeg(data: local &[u8]) Image !ImageError {
     if !is_jpeg(data) : throw .invalid { message: "Not a JPEG file" }
@@ -126,6 +126,9 @@ class Component {
     blocks_w: uint (0)
     blocks_h: uint (0)
     plane: mut &[u8] ([u8]{ 0 x 0 })
+    // Progressive frames gather the coefficients of every block (natural order, 64 per
+    // block) over several scans and transform them at the end
+    coefs: mut &[int] ([int]{ 0 x 0 })
 
     get stride: uint {
         return this.blocks_w * 8
@@ -153,6 +156,15 @@ class Decoder {
     restart_interval: uint (0)
     adobe_transform: int (-1)
     seen_frame: bool (false)
+    progressive: bool (false)
+    // The current scan: spectral band `ss..se` and the successive approximation bit
+    // positions (`ah` previous, `al` this scan); `eobrun` counts blocks with no more
+    // coefficients in the band
+    ss: uint (0)
+    se: uint (63)
+    ah: uint (0)
+    al: uint (0)
+    eobrun: uint (0)
     coef: mut &[int] ([int]{ 0 x 64 })
     tmp: mut &[int] ([int]{ 0 x 64 })
 
@@ -169,13 +181,12 @@ class Decoder {
             if length < 2 || this.pos + length > this.data.length : throw .invalid { message: "Truncated segment" }
             let segment = this.data.view(this.pos + 2, length - 2)
             this.pos += length
-            if marker == 0xc0 || marker == 0xc1 {
+            if marker == 0xc0 || marker == 0xc1 || marker == 0xc2 {
+                this.progressive = marker == 0xc2
                 this.parse_frame(segment) !>
-            } else if marker == 0xc2 || marker == 0xc6 || marker == 0xca || marker == 0xce {
-                throw .unsupported { message: "Progressive JPEG" }
             } else if marker == 0xc3 || marker == 0xc7 || marker == 0xcb || marker == 0xcf {
                 throw .unsupported { message: "Lossless JPEG" }
-            } else if marker == 0xc9 || marker == 0xcd || marker == 0xc5 {
+            } else if marker == 0xc5 || marker == 0xc6 || marker == 0xc9 || marker == 0xca || marker == 0xcd || marker == 0xce {
                 throw .unsupported { message: "Arithmetic-coded or hierarchical JPEG" }
             } else if marker == 0xc4 {
                 this.parse_huffman_tables(segment) !>
@@ -250,6 +261,7 @@ class Decoder {
             comp.blocks_w = this.mcus_x * comp.h
             comp.blocks_h = this.mcus_y * comp.v
             comp.plane = [u8]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
+            if this.progressive : comp.coefs = [int]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
         }
         this.seen_frame = true
     }
@@ -309,15 +321,32 @@ class Decoder {
             comp.td = tables >> 4
             comp.ta = tables & 15
             if comp.td > 3 || comp.ta > 3 : throw .invalid { message: "Bad Huffman table id in scan" }
-            if !isset(this.dc_tables[comp.td.to(uint)]) || !isset(this.ac_tables[comp.ta.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
             if !isset(this.quant[comp.tq.to(uint)]) : throw .invalid { message: "Scan uses a missing quantization table" }
             comp.pred = 0
             this.scan.append(comp)
             i++
         }
-        let ss = segment[1 + count * 2]
-        let se = segment[2 + count * 2]
-        if ss != 0 || se != 63 : throw .unsupported { message: "Progressive JPEG" }
+        this.ss = segment[1 + count * 2].to(uint)
+        this.se = segment[2 + count * 2].to(uint)
+        this.ah = (segment[3 + count * 2] >> 4).to(uint)
+        this.al = (segment[3 + count * 2] & 15).to(uint)
+        this.eobrun = 0
+        if this.progressive {
+            // A DC scan covers coefficient 0 only and may interleave components; an AC
+            // scan covers a band of one component. Refinements add one bit per scan.
+            if this.se > 63 || this.ss > this.se : throw .invalid { message: "Bad spectral selection" }
+            if this.ss == 0 && this.se != 0 : throw .invalid { message: "A DC scan cannot carry AC coefficients" }
+            if this.ss > 0 && count != 1 : throw .invalid { message: "An AC scan must hold one component" }
+            if this.al > 13 || (this.ah != 0 && this.ah != this.al + 1) : throw .invalid { message: "Bad successive approximation" }
+        } else if this.ss != 0 || this.se != 63 || this.ah != 0 || this.al != 0 {
+            throw .invalid { message: "Baseline scan with progressive parameters" }
+        }
+        each this.scan as comp {
+            let needs_dc = this.ss == 0 && this.ah == 0
+            let needs_ac = this.ss > 0 || !this.progressive
+            if needs_dc && !isset(this.dc_tables[comp.td.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
+            if needs_ac && !isset(this.ac_tables[comp.ta.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
+        }
     }
 
     fn decode_scan() !ImageError {
@@ -333,7 +362,7 @@ class Decoder {
             while by < bh {
                 let bx: uint = 0
                 while bx < bw {
-                    this.decode_block(comp, bx, by) !>
+                    this.decode_unit(comp, bx, by) !>
                     mcu_count++
                     if this.restart_interval > 0 && mcu_count % this.restart_interval == 0 && (by < bh - 1 || bx < bw - 1) : this.restart() !>
                     bx++
@@ -351,7 +380,7 @@ class Decoder {
                         while v < comp.v {
                             let h: uint = 0
                             while h < comp.h {
-                                this.decode_block(comp, mx * comp.h + h, my * comp.v + v) !>
+                                this.decode_unit(comp, mx * comp.h + h, my * comp.v + v) !>
                                 h++
                             }
                             v++
@@ -378,7 +407,14 @@ class Decoder {
         while this.pos + 1 < data.length && data[this.pos] == 0xff && data[this.pos + 1] == 0xff : this.pos++
         if this.pos + 1 >= data.length || data[this.pos + 1] < 0xd0 || data[this.pos + 1] > 0xd7 : throw .invalid { message: "Missing restart marker" }
         this.pos += 2
+        this.eobrun = 0
         each this.scan as comp : comp.pred = 0
+    }
+
+    fn decode_unit(comp: Component, bx: uint, by: uint) !ImageError {
+        if bx >= comp.blocks_w || by >= comp.blocks_h : throw .invalid { message: "Block outside the component" }
+        if this.progressive : this.decode_block_progressive(comp, bx, by) !>
+        else : this.decode_block(comp, bx, by) !>
     }
 
     // Tops the accumulator up to at least 57 bits; past a marker it reads zeros
@@ -437,6 +473,136 @@ class Decoder {
         return value
     }
 
+    // One block of a progressive scan: the band `ss..se` of its coefficients, either
+    // their first `al`-shifted approximation or one more bit of precision
+    fn decode_block_progressive(comp: Component, bx: uint, by: uint) !ImageError {
+        let coefs = comp.coefs
+        let base = (by * comp.blocks_w + bx) * 64
+        if this.ss == 0 {
+            if this.ah == 0 {
+                let dc_table = this.dc_tables[comp.td.to(uint)]
+                if !isset(dc_table) : throw .invalid { message: "Missing table" }
+                let category = this.decode_symbol(dc_table) !>
+                if category > 11 : throw .invalid { message: "Bad DC coefficient" }
+                comp.pred += this.receive_extend(category.to(uint))
+                coefs[base] = comp.pred << this.al
+            } else if this.read_bits(1) == 1 {
+                coefs[base] = coefs[base] | (1 << this.al)
+            }
+            return
+        }
+        let ac_table = this.ac_tables[comp.ta.to(uint)]
+        if !isset(ac_table) : throw .invalid { message: "Missing table" }
+        if this.ah == 0 {
+            // First pass over the band: runs of zeros, values, and end-of-band runs that
+            // skip whole blocks
+            if this.eobrun > 0 {
+                this.eobrun--
+                return
+            }
+            let k = this.ss
+            while k <= this.se {
+                let symbol = this.decode_symbol(ac_table) !>
+                let run = (symbol >> 4).to(uint)
+                let size = (symbol & 15).to(uint)
+                if size == 0 {
+                    if run < 15 {
+                        this.eobrun = (1 << run) + this.read_bits(run) - 1
+                        break
+                    }
+                    k += 16
+                    continue
+                }
+                k += run
+                if k > 63 : throw .invalid { message: "Coefficients overflow the block" }
+                coefs[base + zigzag_order[k].to(uint)] = this.receive_extend(size) << this.al
+                k++
+            }
+            return
+        }
+        // Refinement: every coefficient already set gets a correction bit; the zero
+        // positions in between count towards the run before a newly set coefficient
+        let bit: int = 1 << this.al
+        let k = this.ss
+        if this.eobrun > 0 {
+            this.eobrun--
+            while k <= this.se {
+                let at = base + zigzag_order[k].to(uint)
+                if coefs[at] != 0 : this.refine(coefs, at, bit)
+                k++
+            }
+            return
+        }
+        while k <= this.se {
+            let symbol = this.decode_symbol(ac_table) !>
+            let run = (symbol >> 4).to(uint)
+            let size = (symbol & 15).to(uint)
+            let value: int = 0
+            let skip = run
+            if size == 0 {
+                if run < 15 {
+                    this.eobrun = (1 << run) + this.read_bits(run) - 1
+                    // The rest of this block is corrections only
+                    skip = 64
+                }
+            } else {
+                if size != 1 : throw .invalid { message: "Bad refinement code" }
+                value = this.read_bits(1) == 1 ? bit : 0 - bit
+            }
+            while k <= this.se {
+                let at = base + zigzag_order[k].to(uint)
+                k++
+                if coefs[at] != 0 {
+                    this.refine(coefs, at, bit)
+                } else if skip == 0 {
+                    coefs[at] = value
+                    break
+                } else {
+                    skip--
+                }
+            }
+        }
+    }
+
+    // Adds one bit of precision to a coefficient that is already non-zero
+    fn refine(coefs: local mut &[int], at: uint, bit: int) {
+        if this.read_bits(1) == 0 : return
+        let value = coefs[at]
+        if (value & bit) != 0 : return
+        coefs[at] = value > 0 ? value + bit : value - bit
+    }
+
+    // Dequantizes and transforms every block once all scans are in
+    fn render_progressive() !ImageError {
+        let coef = this.coef
+        let natural_quant = [int]{ 0 x 64 }
+        each this.components as comp {
+            let quant = this.quant[comp.tq.to(uint)]
+            if !isset(quant) : throw .invalid { message: "Missing quantization table" }
+            let k: uint = 0
+            while k < 64 {
+                natural_quant[zigzag_order[k].to(uint)] = quant[k].to(int)
+                k++
+            }
+            let coefs = comp.coefs
+            let by: uint = 0
+            while by < comp.blocks_h {
+                let bx: uint = 0
+                while bx < comp.blocks_w {
+                    let base = (by * comp.blocks_w + bx) * 64
+                    let i: uint = 0
+                    while i < 64 {
+                        coef[i] = coefs[base + i] * natural_quant[i]
+                        i++
+                    }
+                    idct_block(coef, this.tmp, comp.plane, (by * 8) * comp.stride + bx * 8, comp.stride)
+                    bx++
+                }
+                by++
+            }
+        }
+    }
+
     fn decode_block(comp: Component, bx: uint, by: uint) !ImageError {
         let dc_table = this.dc_tables[comp.td.to(uint)]
         let ac_table = this.ac_tables[comp.ta.to(uint)]
@@ -464,11 +630,11 @@ class Decoder {
             coef[zigzag_order[k].to(uint)] = this.receive_extend(size) * quant[k].to(int)
             k++
         }
-        if bx >= comp.blocks_w || by >= comp.blocks_h : throw .invalid { message: "Block outside the component" }
         idct_block(coef, this.tmp, comp.plane, (by * 8) * comp.stride + bx * 8, comp.stride)
     }
 
     fn build_image() Image !ImageError {
+        if this.progressive : this.render_progressive() !>
         let count = this.components.length
         let image = Image.new(this.width, this.height, count == 1 ? 1 : 3) !>
         if count == 1 {

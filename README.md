@@ -62,7 +62,7 @@ Every `encode_*` has an `encode_*_into(writer)` twin that writes to any `io.Writ
 | Format | Reads | Writes |
 |---|---|---|
 | PNG | all bit depths and color types, palettes, transparency, interlaced | 8-bit gray, RGB, RGBA |
-| JPEG | baseline (progressive is not supported yet) | baseline gray or YCbCr |
+| JPEG | baseline and progressive, any chroma sampling | baseline gray or YCbCr |
 | BMP | uncompressed 1 to 32-bit, including bit-field masks | 8-bit gray, 24-bit RGB, 32-bit RGBA |
 
 ### Image
