@@ -6,7 +6,7 @@ test:
 lint:
 	$(vc) build ./src --lint
 
-doc:
+docs:
 	$(vc) doc ./src -o docs/api.md --markdown --no-private
 
-.PHONY: test lint doc
+.PHONY: test lint docs
