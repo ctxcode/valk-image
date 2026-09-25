@@ -1,0 +1,1084 @@
+use valk.math
+use valk.mem
+
+// ---------------------------------------------------------------------------------------
+// VP8 (lossy) encoder: one key frame with a single token partition. Each macroblock tries
+// its predictions and keeps the best trade of distortion against bits. The decoder does the
+// reconstruction, so later predictions start from exactly what a decoder will see. Token
+// probabilities are fitted to the image in a counting pass before anything is written.
+
+extend Image {
+    /// Encodes the image as a lossy WebP at `quality`, from 0 (smallest) to 100 (best).
+    ///
+    /// The alpha of an RGBA image is kept exactly, in an alpha chunk beside the lossy color.
+    /// Throws `range` when a side exceeds 16383 pixels, the format's limit.
+    + fn encode_webp(quality: uint (75)) String !ImageError {
+        if this.width > 16383 || this.height > 16383 : throw .range { message: "Lossy WebP images are limited to 16383 pixels per side" }
+        let encoder = Vp8Encoder.new(this, quality_index(quality > 100 ? 100 : quality))
+        let frame = encoder.encode()
+        if this.channels != 4 : return webp_file("VP8 ", frame)
+        let alpha = [uint]{ 0 x this.width * this.height }
+        let opaque = true
+        each alpha as _, i {
+            let a = this.pixels[i * 4 + 3]
+            if a != 255 : opaque = false
+            alpha[i] = a.to(uint) << 8
+        }
+        if opaque : return webp_file("VP8 ", frame)
+        // Alpha as a lossless image stream in the green channel, without a VP8L header
+        let chunk = ByteBuffer.new(alpha.length / 4 + 16)
+        chunk.write_byte(1)
+        chunk.write(lossless_stream(alpha, this.width, this.height))
+        let out = ByteBuffer.new(frame.length + chunk.length + 64)
+        out.write("RIFF")
+        out.write_u32_le((4 + 18 + 8 + chunk.length + (chunk.length & 1) + 8 + frame.length + (frame.length & 1)).to(u32))
+        out.write("WEBP")
+        let header = ByteBuffer.new(10)
+        header.write_byte(0x10)
+        header.write_byte(0)
+        header.write_byte(0)
+        header.write_byte(0)
+        header.write_little_endian(this.width - 1, 3)
+        header.write_little_endian(this.height - 1, 3)
+        write_chunk(out, "VP8X", header)
+        write_chunk(out, "ALPH", chunk)
+        write_chunk(out, "VP8 ", frame)
+        return out.into_string()
+    }
+}
+
+// libwebp's mapping from quality to the quantizer index, without its per-segment spread
+fn quality_index(quality: uint) uint {
+    let c = quality.to(f64) / 100
+    let linear = c < 0.75 ? c * 2 / 3 : 2 * c - 1
+    let q = (127 * (1 - math.cbrt(linear))).to(int)
+    return q < 0 ? 0 : (q > 127 ? 127 : q.to(uint))
+}
+
+// The boolean entropy coder, the inverse of `BoolDecoder` (after libwebp's VP8BitWriter)
+class BoolEncoder {
+    out: ByteBuffer
+    range_m1: uint (254)
+    value: int (0)
+    // Bytes of 0xff held back until a carry either reaches them or not
+    run: uint (0)
+    n_bits: int (-8)
+
+    fn put(bit: uint, prob: uint) {
+        let split = (this.range_m1 * prob) >> 8
+        if bit != 0 {
+            this.value += (split + 1).to(int)
+            this.range_m1 -= split + 1
+        } else {
+            this.range_m1 = split
+        }
+        if this.range_m1 < 127 {
+            let shift = lut_shift[this.range_m1].to(uint)
+            this.range_m1 = lut_range_m1[this.range_m1].to(uint)
+            this.value = this.value << shift
+            this.n_bits += shift.to(int)
+            if this.n_bits > 0 : this.flush()
+        }
+    }
+    fn put_bits(value: uint, count: uint) {
+        let n = count
+        while n > 0 {
+            n--
+            this.put((value >> n) & 1, UNIFORM_PROB)
+        }
+    }
+    fn put_signed(value: int, count: uint) {
+        if value == 0 {
+            this.put(0, UNIFORM_PROB)
+            return
+        }
+        this.put(1, UNIFORM_PROB)
+        this.put_bits((value < 0 ? 0 - value : value).to(uint), count)
+        this.put(value < 0 ? 1 : 0, UNIFORM_PROB)
+    }
+    fn flush() {
+        let s = (8 + this.n_bits).to(uint)
+        let bits = this.value >> s
+        this.value -= bits << s
+        this.n_bits -= 8
+        if (bits & 0xff) == 0xff {
+            this.run++
+            return
+        }
+        let out = this.out
+        if (bits & 0x100) != 0 && out.length > 0 : out[out.length - 1] = out[out.length - 1] + 1
+        while this.run > 0 {
+            out.write_byte((bits & 0x100) != 0 ? 0 : 0xff)
+            this.run--
+        }
+        out.write_byte((bits & 0xff).to(u8))
+    }
+    fn finish() ByteBuffer {
+        this.put_bits(0, (9 - this.n_bits).to(uint))
+        this.n_bits = 0
+        this.flush()
+        return this.out
+    }
+}
+
+// Where coded bits go: into an encoder, into a count per token probability, or into a running
+// cost in bits
+class Vp8Sink {
+    encoder: ?BoolEncoder (null)
+    counts: ?mut &[uint] (null)
+    cost: f64 (0)
+    // The token probabilities in use
+    probs: mut &[uint]
+    // The cost of a 0 bit per probability; a 1 bit at p costs what a 0 bit at 256 - p does
+    costs: mut &[f64]
+
+    fn put(prob: uint, bit: uint) {
+        let encoder = this.encoder
+        if isset(encoder) {
+            encoder.put(bit, prob)
+            return
+        }
+        if isset(this.counts) : return
+        this.cost += this.costs[bit == 0 ? prob : 256 - prob]
+    }
+    fn token(index: uint, bit: uint) {
+        let counts = this.counts
+        if isset(counts) {
+            counts[index * 2 + bit]++
+            return
+        }
+        this.put(this.probs[index], bit)
+    }
+    fn take_cost() f64 {
+        let cost = this.cost
+        this.cost = 0
+        return cost
+    }
+}
+
+fn bit_costs() mut &[f64] {
+    let costs = [f64]{ 0 x 257 }
+    let p: uint = 1
+    while p <= 256 {
+        costs[p] = 0 - math.log2(p.to(f64) / 256)
+        p++
+    }
+    // Probability 0 never occurs; keep it expensive
+    costs[0] = 16
+    return costs
+}
+
+// The tokens of one block, levels in zigzag order from `start`; returns 1 when any was coded
+fn put_tokens(sink: Vp8Sink, levels: local &[i16], at: uint, start: uint, plane: uint, context: uint) uint {
+    let plane_base = plane * NUM_BANDS * NUM_CONTEXTS * NUM_PROBS
+    let last: uint = 16
+    let k: uint = 16
+    while k > start {
+        k--
+        if levels[at + k] != 0 {
+            last = k
+            break
+        }
+    }
+    let p = plane_base + (coeff_bands[start].to(uint) * NUM_CONTEXTS + context) * NUM_PROBS
+    if last == 16 {
+        sink.token(p, 0)
+        return 0
+    }
+    sink.token(p, 1)
+    let n = start
+    while n <= last {
+        let level = levels[at + n].to(int)
+        let v = (level < 0 ? 0 - level : level).to(uint)
+        n++
+        if v == 0 {
+            sink.token(p + 1, 0)
+            p = plane_base + coeff_bands[n].to(uint) * NUM_CONTEXTS * NUM_PROBS
+            continue
+        }
+        sink.token(p + 1, 1)
+        put_value(sink, p, v)
+        sink.put(UNIFORM_PROB, level < 0 ? 1 : 0)
+        p = plane_base + (coeff_bands[n].to(uint) * NUM_CONTEXTS + (v == 1 ? 1 : 2)) * NUM_PROBS
+        if n < 16 : sink.token(p, n <= last ? 1 : 0)
+    }
+    return 1
+}
+
+// A coefficient's magnitude down the token tree, with the extra bits of the larger categories
+fn put_value(sink: Vp8Sink, p: uint, v: uint) {
+    if v == 1 {
+        sink.token(p + 2, 0)
+        return
+    }
+    sink.token(p + 2, 1)
+    if v <= 4 {
+        sink.token(p + 3, 0)
+        if v == 2 {
+            sink.token(p + 4, 0)
+            return
+        }
+        sink.token(p + 4, 1)
+        sink.token(p + 5, v - 3)
+        return
+    }
+    sink.token(p + 3, 1)
+    if v <= 10 {
+        sink.token(p + 6, 0)
+        if v <= 6 {
+            sink.token(p + 7, 0)
+            sink.put(159, v - 5)
+            return
+        }
+        sink.token(p + 7, 1)
+        sink.put(165, (v - 7) >> 1)
+        sink.put(145, (v - 7) & 1)
+        return
+    }
+    sink.token(p + 6, 1)
+    let cat: uint = v <= 18 ? 0 : (v <= 34 ? 1 : (v <= 66 ? 2 : 3))
+    sink.token(p + 8, cat >> 1)
+    sink.token(p + 9 + (cat >> 1), cat & 1)
+    let extra = v - 3 - (8 << cat)
+    let bits: uint = 0
+    while cat_probs[cat * 12 + bits] != 0 : bits++
+    let i: uint = 0
+    while i < bits {
+        sink.put(cat_probs[cat * 12 + i].to(uint), (extra >> (bits - 1 - i)) & 1)
+        i++
+    }
+}
+
+// The mode of a 4x4 luma block down its tree, with probabilities from its neighbors' modes
+fn put_b_mode(sink: Vp8Sink, above: uint, left: uint, mode: uint) {
+    let probs = (above * 10 + left) * 9
+    sink.put(pred_probs[probs].to(uint), mode == PRED_DC ? 0 : 1)
+    if mode == PRED_DC : return
+    sink.put(pred_probs[probs + 1].to(uint), mode == PRED_TM ? 0 : 1)
+    if mode == PRED_TM : return
+    sink.put(pred_probs[probs + 2].to(uint), mode == PRED_VE ? 0 : 1)
+    if mode == PRED_VE : return
+    let far = mode == PRED_LD || mode == PRED_VL || mode == PRED_HD || mode == PRED_HU
+    sink.put(pred_probs[probs + 3].to(uint), far ? 1 : 0)
+    if !far {
+        sink.put(pred_probs[probs + 4].to(uint), mode == PRED_HE ? 0 : 1)
+        if mode != PRED_HE : sink.put(pred_probs[probs + 5].to(uint), mode == PRED_RD ? 0 : 1)
+        return
+    }
+    sink.put(pred_probs[probs + 6].to(uint), mode == PRED_LD ? 0 : 1)
+    if mode == PRED_LD : return
+    sink.put(pred_probs[probs + 7].to(uint), mode == PRED_VL ? 0 : 1)
+    if mode == PRED_VL : return
+    sink.put(pred_probs[probs + 8].to(uint), mode == PRED_HD ? 0 : 1)
+}
+
+fn put_y16_mode(sink: Vp8Sink, mode: uint) {
+    sink.put(145, 1)
+    if mode == PRED_DC || mode == PRED_VE {
+        sink.put(156, 0)
+        sink.put(163, mode == PRED_VE ? 1 : 0)
+        return
+    }
+    sink.put(156, 1)
+    sink.put(128, mode == PRED_TM ? 1 : 0)
+}
+
+fn put_uv_mode(sink: Vp8Sink, mode: uint) {
+    sink.put(142, mode == PRED_DC ? 0 : 1)
+    if mode == PRED_DC : return
+    sink.put(114, mode == PRED_VE ? 0 : 1)
+    if mode == PRED_VE : return
+    sink.put(183, mode == PRED_HE ? 0 : 1)
+}
+
+// Per macroblock: the luma mode (a 16x16 mode, or MODE_4X4), the 16 4x4 modes, and the chroma
+// mode
+value MB_MODES (18)
+value MODE_4X4 (255)
+// Per macroblock: levels in zigzag order, 16 luma blocks, 4 + 4 chroma blocks and the
+// second-order luma block, laid out as the decoder's coefficients
+value MB_LEVELS (400)
+value LEVELS_Y2 (384)
+// Quantization rounding, in 1/256 of a step, per kind of block (DC, AC): libwebp's
+value BIAS_Y1_DC (96)
+value BIAS_Y1_AC (110)
+value BIAS_Y2_DC (96)
+value BIAS_Y2_AC (108)
+value BIAS_UV_DC (110)
+value BIAS_UV_AC (115)
+value MAX_LEVEL (2047)
+
+class Vp8Encoder {
+    width: uint
+    height: uint
+    mbw: uint
+    mbh: uint
+    // The source planes, padded to whole macroblocks by repeating the last row and column
+    y: mut &[u8]
+    u: mut &[u8]
+    v: mut &[u8]
+    q: uint
+    // Dequantization steps as the decoder has them: y1 dc/ac, y2 dc/ac, uv dc/ac
+    steps: mut &[int] ([int]{ 0 x 6 })
+    lambda_i4: f64 (0)
+    lambda_i16: f64 (0)
+    lambda_uv: f64 (0)
+    lambda_mode: f64 (0)
+    // The decoder reconstructs into its planes and work area, and keeps the contexts
+    rec: Vp8Decoder
+    modes: mut &[u8]
+    levels: mut &[i16]
+    // Bit costs while choosing, under the default token probabilities
+    sink: Vp8Sink
+    // The macroblock being chosen, and its levels
+    mbx: uint (0)
+    mby: uint (0)
+    mb_levels: mut &[i16] ([i16]{ 0 x MB_LEVELS })
+    // Scratch: one block's levels and its forward transform, and the 16 luma DCs
+    block: mut &[i16] ([i16]{ 0 x 16 })
+    dct: mut &[int] ([int]{ 0 x 16 })
+    dc: mut &[int] ([int]{ 0 x 16 })
+    // The bits of the last coding tried
+    bits: f64 (0)
+
+    static fn new(img: Image, q: uint) SELF {
+        let mbw = (img.width + 15) >> 4
+        let mbh = (img.height + 15) >> 4
+        let rec = Vp8Decoder { data: [u8]{ 0 x 0 } }
+        rec.width = img.width
+        rec.height = img.height
+        rec.mbw = mbw
+        rec.mbh = mbh
+        rec.y_stride = mbw * 16
+        rec.c_stride = mbw * 8
+        rec.y_plane = [u8]{ 0 x mbw * 16 * mbh * 16 }
+        rec.u_plane = [u8]{ 0 x mbw * 8 * mbh * 8 }
+        rec.v_plane = [u8]{ 0 x mbw * 8 * mbh * 8 }
+        rec.up_pred = [uint]{ 0 x mbw * 4 }
+        rec.up_nz = [uint]{ 0 x mbw }
+        rec.up_nz_y16 = [uint]{ 0 x mbw }
+        let probs = [uint]{ 0 x 1056 }
+        each probs as _, i : probs[i] = default_token_probs[i].to(uint)
+        let encoder = SELF {
+            width: img.width
+            height: img.height
+            mbw: mbw
+            mbh: mbh
+            y: [u8]{ 0 x mbw * 16 * mbh * 16 }
+            u: [u8]{ 0 x mbw * 8 * mbh * 8 }
+            v: [u8]{ 0 x mbw * 8 * mbh * 8 }
+            q: q
+            rec: rec
+            modes: [u8]{ 0 x mbw * mbh * MB_MODES }
+            levels: [i16]{ 0 x mbw * mbh * MB_LEVELS }
+            sink: Vp8Sink { probs: probs, costs: bit_costs() }
+        }
+        encoder.convert(img)
+        let steps = encoder.steps
+        steps[0] = dequant_dc[q].to(int)
+        steps[1] = dequant_ac[q].to(int)
+        steps[2] = dequant_dc[q].to(int) * 2
+        let y2ac = dequant_ac[q].to(int) * 155 / 100
+        steps[3] = y2ac < 8 ? 8 : y2ac
+        steps[4] = dequant_dc[clip_index(q.to(int), 117)].to(int)
+        steps[5] = dequant_ac[q].to(int)
+        // libwebp's lambdas: per kind of block while choosing its mode, and between 16x16 and
+        // 4x4 luma
+        let ac = steps[1].to(f64)
+        let y2 = steps[3].to(f64)
+        let uv = steps[5].to(f64)
+        encoder.lambda_i4 = 3 * ac * ac / 128
+        encoder.lambda_i16 = 3 * y2 * y2
+        encoder.lambda_uv = 3 * uv * uv / 64
+        encoder.lambda_mode = ac * ac / 128
+        return encoder
+    }
+
+    // RGB to YUV 4:2:0 with libwebp's coefficients; chroma averages each 2x2 square
+    fn convert(img: Image) {
+        let c = img.channels.to(uint)
+        let pixels = img.pixels
+        let w = img.width
+        let h = img.height
+        let y_stride = this.mbw * 16
+        let y: uint = 0
+        while y < this.mbh * 16 {
+            let sy = y < h ? y : h - 1
+            let x: uint = 0
+            while x < y_stride {
+                let p = (sy * w + (x < w ? x : w - 1)) * c
+                let r = pixels[p].to(int)
+                let g = c < 3 ? r : pixels[p + 1].to(int)
+                let b = c < 3 ? r : pixels[p + 2].to(int)
+                this.y[y * y_stride + x] = ((16839 * r + 33059 * g + 6420 * b + (1 << 15) + (16 << 16)) >> 16).to(u8)
+                x++
+            }
+            y++
+        }
+        let c_stride = this.mbw * 8
+        y = 0
+        while y < this.mbh * 8 {
+            let x: uint = 0
+            while x < c_stride {
+                let r: int = 0
+                let g: int = 0
+                let b: int = 0
+                let dy: uint = 0
+                while dy < 2 {
+                    let sy = 2 * y + dy < h ? 2 * y + dy : h - 1
+                    let dx: uint = 0
+                    while dx < 2 {
+                        let sx = 2 * x + dx < w ? 2 * x + dx : w - 1
+                        let p = (sy * w + sx) * c
+                        let pr = pixels[p].to(int)
+                        r += pr
+                        g += c < 3 ? pr : pixels[p + 1].to(int)
+                        b += c < 3 ? pr : pixels[p + 2].to(int)
+                        dx++
+                    }
+                    dy++
+                }
+                let round = (1 << 17) + (128 << 18)
+                this.u[y * c_stride + x] = clip_pixel((-9719 * r - 19081 * g + 28800 * b + round) >> 18)
+                this.v[y * c_stride + x] = clip_pixel((28800 * r - 24116 * g - 4684 * b + round) >> 18)
+                x++
+            }
+            y++
+        }
+    }
+
+    fn encode() ByteBuffer {
+        // Choose every macroblock's modes and levels, reconstructing as a decoder will
+        let rec = this.rec
+        this.mby = 0
+        while this.mby < this.mbh {
+            rec.left_nz = 0
+            rec.left_nz_y16 = 0
+            let i: uint = 0
+            while i < 4 : rec.left_pred[i++] = PRED_DC
+            this.mbx = 0
+            while this.mbx < this.mbw {
+                this.analyze()
+                this.mbx++
+            }
+            this.mby++
+        }
+
+        // Fit the token probabilities, and the skip probability, to what will be coded
+        let costs = this.sink.costs
+        let counts = [uint]{ 0 x 1056 * 2 }
+        let skipped = this.put_all_tokens(Vp8Sink { counts: counts, probs: this.sink.probs, costs: costs }, false)
+        let probs = [uint]{ 0 x 1056 }
+        let updates = [bool]{ false x 1056 }
+        each probs as _, i {
+            let old = default_token_probs[i].to(uint)
+            probs[i] = old
+            let zeros = counts[i * 2]
+            let ones = counts[i * 2 + 1]
+            let total = zeros + ones
+            if total == 0 : continue
+            let fitted = (255 * zeros + total / 2) / total
+            if fitted < 1 : fitted = 1
+            let update = token_update_probs[i].to(uint)
+            let keep_cost = zeros.to(f64) * costs[old] + ones.to(f64) * costs[256 - old] + costs[update]
+            let new_cost = zeros.to(f64) * costs[fitted] + ones.to(f64) * costs[256 - fitted] + costs[256 - update] + 8
+            if new_cost < keep_cost {
+                probs[i] = fitted
+                updates[i] = true
+            }
+        }
+        let total_mbs = this.mbw * this.mbh
+        let skip_prob: uint = 0
+        if skipped > 0 {
+            skip_prob = ((total_mbs - skipped) * 255 + total_mbs / 2) / total_mbs
+            if skip_prob < 1 : skip_prob = 1
+            if skip_prob > 254 : skip_prob = 254
+        }
+
+        // The first partition: the frame header, then every macroblock's modes
+        let first = BoolEncoder { out: ByteBuffer.new(4096 + total_mbs * 4) }
+        first.put(0, UNIFORM_PROB) // color space
+        first.put(0, UNIFORM_PROB) // clamping type
+        first.put(0, UNIFORM_PROB) // no segments
+        first.put(0, UNIFORM_PROB) // the normal loop filter
+        first.put_bits(this.filter_level(), 6)
+        first.put_bits(0, 3) // sharpness
+        first.put(0, UNIFORM_PROB) // no filter deltas
+        first.put_bits(0, 2) // one token partition
+        first.put_bits(this.q, 7)
+        let d: uint = 0
+        while d < 5 {
+            first.put_signed(0, 4)
+            d++
+        }
+        first.put(0, UNIFORM_PROB) // refresh_entropy_probs
+        each probs as prob, i {
+            first.put(updates[i] ? 1 : 0, token_update_probs[i].to(uint))
+            if updates[i] : first.put_bits(prob, 8)
+        }
+        first.put(skipped > 0 ? 1 : 0, UNIFORM_PROB)
+        if skipped > 0 : first.put_bits(skip_prob, 8)
+        let header = Vp8Sink { encoder: first, probs: probs, costs: costs }
+        let up_modes = [uint]{ 0 x this.mbw * 4 }
+        let left_modes = [uint]{ 0 x 4 }
+        let mb: uint = 0
+        while mb < total_mbs {
+            let mbx = mb % this.mbw
+            if mbx == 0 {
+                let i: uint = 0
+                while i < 4 : left_modes[i++] = PRED_DC
+            }
+            let m = mb * MB_MODES
+            if skipped > 0 : first.put(this.is_empty(mb) ? 1 : 0, skip_prob)
+            if this.modes[m] != MODE_4X4 {
+                let mode = this.modes[m].to(uint)
+                put_y16_mode(header, mode)
+                let i: uint = 0
+                while i < 4 {
+                    up_modes[mbx * 4 + i] = mode
+                    left_modes[i] = mode
+                    i++
+                }
+            } else {
+                first.put(0, 145)
+                let n: uint = 0
+                while n < 16 {
+                    let mode = this.modes[m + 1 + n].to(uint)
+                    put_b_mode(header, up_modes[mbx * 4 + (n & 3)], left_modes[n >> 2], mode)
+                    up_modes[mbx * 4 + (n & 3)] = mode
+                    left_modes[n >> 2] = mode
+                    n++
+                }
+            }
+            put_uv_mode(header, this.modes[m + 17].to(uint))
+            mb++
+        }
+        let first_bytes = first.finish()
+
+        // The token partition
+        let tokens = BoolEncoder { out: ByteBuffer.new(total_mbs * 64 + 1024) }
+        this.put_all_tokens(Vp8Sink { encoder: tokens, probs: probs, costs: costs }, skipped > 0)
+        let token_bytes = tokens.finish()
+
+        let out = ByteBuffer.new(first_bytes.length + token_bytes.length + 16)
+        // A key frame, version 0, shown, and the size of the first partition
+        let tag = (1 << 4) | (first_bytes.length << 5)
+        out.write_byte(tag.to(u8))
+        out.write_byte((tag >> 8).to(u8))
+        out.write_byte((tag >> 16).to(u8))
+        out.write_byte(0x9d)
+        out.write_byte(0x01)
+        out.write_byte(0x2a)
+        out.write_u16_le(this.width.to(u16))
+        out.write_u16_le(this.height.to(u16))
+        out.write(first_bytes)
+        out.write(token_bytes)
+        return out
+    }
+
+    // A loop filter level that grows with the quantizer step
+    fn filter_level() uint {
+        let level = (this.steps[1] * 3 + 4) / 8
+        return level > 63 ? 63 : level.to(uint)
+    }
+
+    fn is_empty(mb: uint) bool {
+        let levels = this.levels
+        let at = mb * MB_LEVELS
+        let i: uint = 0
+        while i < MB_LEVELS {
+            if levels[at + i] != 0 : return false
+            i++
+        }
+        return true
+    }
+
+    // Every macroblock's tokens with the decoder's contexts; returns how many macroblocks
+    // hold no levels. With `skip`, those send no tokens.
+    fn put_all_tokens(sink: Vp8Sink, skip: bool) uint {
+        let up_nz = [uint]{ 0 x this.mbw }
+        let up_nz_y16 = [uint]{ 0 x this.mbw }
+        let levels = this.levels
+        let skipped: uint = 0
+        let left_nz: uint = 0
+        let left_nz_y16: uint = 0
+        let mb: uint = 0
+        while mb < this.mbw * this.mbh {
+            let mbx = mb % this.mbw
+            if mbx == 0 {
+                left_nz = 0
+                left_nz_y16 = 0
+            }
+            let i16 = this.modes[mb * MB_MODES] != MODE_4X4
+            let empty = this.is_empty(mb)
+            if empty : skipped++
+            if empty && skip {
+                left_nz = 0
+                up_nz[mbx] = 0
+                if i16 {
+                    left_nz_y16 = 0
+                    up_nz_y16[mbx] = 0
+                }
+                mb++
+                continue
+            }
+            let at = mb * MB_LEVELS
+            if i16 {
+                let nz = put_tokens(sink, levels, at + LEVELS_Y2, 0, PLANE_Y2, left_nz_y16 + up_nz_y16[mbx])
+                left_nz_y16 = nz
+                up_nz_y16[mbx] = nz
+            }
+            let luma = put_luma_tokens(sink, levels, at, i16, left_nz, up_nz[mbx])
+            let chroma = put_chroma_tokens(sink, levels, at, left_nz >> 4, up_nz[mbx] >> 4)
+            left_nz = (luma & 0xf) | ((chroma & 0xf) << 4)
+            up_nz[mbx] = (luma >> 4) | (chroma & 0xf0)
+            mb++
+        }
+        return skipped
+    }
+
+    // Picks the modes of one macroblock, quantizes its residuals and reconstructs it
+    fn analyze() {
+        let rec = this.rec
+        let mbx = this.mbx
+        let mb = this.mby * this.mbw + mbx
+        rec.prepare_ybr(mbx, this.mby)
+        let levels = this.mb_levels
+        each levels as _, i : levels[i] = 0
+
+        // The 16x16 mode with the best score, then 4x4 blocks if they beat it
+        let best16: uint = PRED_DC
+        let best16_score: f64 = -1
+        let mode: uint = 0
+        while mode < 4 {
+            let score = this.code_y16(mode) + this.lambda_i16 * this.bits
+            if best16_score < 0 || score < best16_score {
+                best16 = mode
+                best16_score = score
+            }
+            mode++
+        }
+        let y16_score = this.code_y16(best16) + this.lambda_mode * this.bits
+        let use_4x4 = this.code_y4(y16_score)
+        if !use_4x4 : this.code_y16(best16)
+        let m = mb * MB_MODES
+        this.modes[m] = use_4x4 ? MODE_4X4 : best16.to(u8)
+        if use_4x4 {
+            let n: uint = 0
+            while n < 16 {
+                this.modes[m + 1 + n] = rec.pred_y4[n].to(u8)
+                n++
+            }
+        } else {
+            let i: uint = 0
+            while i < 4 {
+                rec.up_pred[mbx * 4 + i] = best16
+                rec.left_pred[i] = best16
+                i++
+            }
+        }
+
+        // Chroma
+        let best_uv: uint = PRED_DC
+        let best_uv_score: f64 = -1
+        mode = 0
+        while mode < 4 {
+            let score = this.code_uv(mode) + this.lambda_uv * this.bits
+            if best_uv_score < 0 || score < best_uv_score {
+                best_uv = mode
+                best_uv_score = score
+            }
+            mode++
+        }
+        this.code_uv(best_uv)
+        this.modes[m + 17] = best_uv.to(u8)
+
+        // The contexts the next macroblocks see, as the decoder will have them
+        let sink = this.sink
+        let luma = put_luma_tokens(sink, levels, 0, !use_4x4, rec.left_nz, rec.up_nz[mbx])
+        let chroma = put_chroma_tokens(sink, levels, 0, rec.left_nz >> 4, rec.up_nz[mbx] >> 4)
+        sink.take_cost()
+        rec.left_nz = (luma & 0xf) | ((chroma & 0xf) << 4)
+        rec.up_nz[mbx] = (luma >> 4) | (chroma & 0xf0)
+        if !use_4x4 {
+            let nz: uint = has_levels(levels, LEVELS_Y2, 0) ? 1 : 0
+            rec.left_nz_y16 = nz
+            rec.up_nz_y16[mbx] = nz
+        }
+        copy_levels(levels, 0, this.levels, mb * MB_LEVELS, MB_LEVELS)
+
+        // The reconstruction into the planes, for the macroblocks to come
+        let ybr = rec.ybr
+        let y: uint = 0
+        while y < 16 {
+            mem.copy(ybr.view(YBR_Y + y * YBR_STRIDE, 16), rec.y_plane.view((this.mby * 16 + y) * rec.y_stride + mbx * 16, 16))
+            y++
+        }
+        y = 0
+        while y < 8 {
+            mem.copy(ybr.view(YBR_B + y * YBR_STRIDE, 8), rec.u_plane.view((this.mby * 8 + y) * rec.c_stride + mbx * 8, 8))
+            mem.copy(ybr.view(YBR_R + y * YBR_STRIDE, 8), rec.v_plane.view((this.mby * 8 + y) * rec.c_stride + mbx * 8, 8))
+            y++
+        }
+    }
+
+    // Codes the luma as one 16x16 prediction plus the second-order block of its DCs, and
+    // reconstructs it; returns the distortion and leaves the bits in `bits`
+    fn code_y16(mode: uint) f64 {
+        let rec = this.rec
+        let levels = this.mb_levels
+        let steps = this.steps
+        rec.predict_large(YBR_Y, 16, edge_mode(this.mbx, this.mby, mode))
+        let coeff = rec.coeff
+        let i: uint = 0
+        while i < 256 : coeff[i++] = 0
+        i = COEFF_WHT
+        while i < 400 : coeff[i++] = 0
+        let n: uint = 0
+        while n < 16 {
+            this.forward_dct(n_at(n), this.y, this.luma_at(n), this.mbw * 16)
+            this.dc[n] = this.dct[0]
+            quantize_block(this.dct, levels, n * 16, 1, steps[0], steps[1], BIAS_Y1_DC, BIAS_Y1_AC)
+            dequantize_block(levels, n * 16, coeff, n * 16, steps[0], steps[1])
+            n++
+        }
+        forward_wht(this.dc, this.dct)
+        quantize_block(this.dct, levels, LEVELS_Y2, 0, steps[2], steps[3], BIAS_Y2_DC, BIAS_Y2_AC)
+        dequantize_block(levels, LEVELS_Y2, coeff, COEFF_WHT, steps[2], steps[3])
+        rec.inverse_wht()
+        let nz_ac: uint = 0
+        let nz_dc: uint = 0
+        n = 0
+        while n < 16 {
+            if has_levels(levels, n * 16, 1) : nz_ac = nz_ac | (1 << n)
+            if coeff[n * 16] != 0 : nz_dc = nz_dc | (1 << n)
+            n++
+        }
+        rec.nz_ac_mask = nz_ac
+        rec.nz_dc_mask = nz_dc
+        n = 0
+        while n < 16 {
+            rec.add_residual(n_at(n), n * 16)
+            n++
+        }
+        let sink = this.sink
+        put_y16_mode(sink, mode)
+        put_tokens(sink, levels, LEVELS_Y2, 0, PLANE_Y2, rec.left_nz_y16 + rec.up_nz_y16[this.mbx])
+        put_luma_tokens(sink, levels, 0, true, rec.left_nz, rec.up_nz[this.mbx])
+        this.bits = sink.take_cost()
+        return this.distortion(YBR_Y, this.y, this.luma_at(0), this.mbw * 16, 16)
+    }
+
+    // Codes the luma as sixteen 4x4 predictions, each block with its best mode, and
+    // reconstructs it; returns whether the total beats `bar`, the score of 16x16 coding
+    fn code_y4(bar: f64) bool {
+        let rec = this.rec
+        let levels = this.mb_levels
+        let mbx = this.mbx
+        let i: uint = 0
+        while i < 256 : levels[i++] = 0
+        i = LEVELS_Y2
+        while i < 400 : levels[i++] = 0
+        rec.nz_ac_mask = 0
+        rec.nz_dc_mask = 0
+        // The flag for 4x4 luma
+        let total = this.lambda_mode * this.sink.costs[256 - 145]
+        let lnz = rec.left_nz & 0x0f
+        let unz = rec.up_nz[mbx] & 0x0f
+        let above = [uint]{ 0 x 4 }
+        let left = [uint]{ 0 x 4 }
+        i = 0
+        while i < 4 {
+            above[i] = rec.up_pred[mbx * 4 + i]
+            left[i] = rec.left_pred[i]
+            i++
+        }
+        let n: uint = 0
+        while n < 16 {
+            let bx = n & 3
+            let by = n >> 2
+            let context = ((lnz >> by) & 1) + ((unz >> bx) & 1)
+            let best: uint = 0
+            let best_score: f64 = -1
+            let mode: uint = 0
+            while mode < 10 {
+                let score = this.code_block4(n, mode, above[bx], left[by], context) + this.lambda_i4 * this.bits
+                if best_score < 0 || score < best_score {
+                    best = mode
+                    best_score = score
+                }
+                mode++
+            }
+            // Again with the winner, so the work area holds its reconstruction
+            total += this.code_block4(n, best, above[bx], left[by], context) + this.lambda_mode * this.bits
+            if total >= bar : return false
+            copy_levels(this.block, 0, levels, n * 16, 16)
+            let nz: uint = has_levels(this.block, 0, 0) ? 1 : 0
+            unz = (unz & (0xf ^ (1 << bx))) | (nz << bx)
+            lnz = (lnz & (0xf ^ (1 << by))) | (nz << by)
+            rec.pred_y4[n] = best
+            above[bx] = best
+            left[by] = best
+            n++
+        }
+        i = 0
+        while i < 4 {
+            rec.up_pred[mbx * 4 + i] = above[i]
+            rec.left_pred[i] = left[i]
+            i++
+        }
+        return true
+    }
+
+    // Predicts, codes and reconstructs 4x4 luma block `n` in `mode`; returns its distortion
+    // and leaves its bits in `bits`
+    fn code_block4(n: uint, mode: uint, above: uint, left: uint, context: uint) f64 {
+        let rec = this.rec
+        let at = n_at(n)
+        rec.predict4(at, mode)
+        let block = this.block
+        this.forward_dct(at, this.y, this.luma_at(n), this.mbw * 16)
+        quantize_block(this.dct, block, 0, 0, this.steps[0], this.steps[1], BIAS_Y1_DC, BIAS_Y1_AC)
+        let coeff = rec.coeff
+        dequantize_block(block, 0, coeff, n * 16, this.steps[0], this.steps[1])
+        let bit: uint = 1 << n
+        rec.nz_ac_mask = has_levels(block, 0, 0) ? rec.nz_ac_mask | bit : rec.nz_ac_mask & (0xffffff ^ bit)
+        rec.nz_dc_mask = coeff[n * 16] != 0 ? rec.nz_dc_mask | bit : rec.nz_dc_mask & (0xffffff ^ bit)
+        rec.add_residual(at, n * 16)
+        let sink = this.sink
+        put_b_mode(sink, above, left, mode)
+        put_tokens(sink, block, 0, 0, PLANE_Y1_SANS_Y2, context)
+        this.bits = sink.take_cost()
+        return this.distortion(at, this.y, this.luma_at(n), this.mbw * 16, 4)
+    }
+
+    // Codes both chroma planes in `mode` and reconstructs them; returns the distortion and
+    // leaves the bits in `bits`
+    fn code_uv(mode: uint) f64 {
+        let rec = this.rec
+        let levels = this.mb_levels
+        let steps = this.steps
+        let edge = edge_mode(this.mbx, this.mby, mode)
+        rec.predict_large(YBR_B, 8, edge)
+        rec.predict_large(YBR_R, 8, edge)
+        let coeff = rec.coeff
+        let c_stride = this.mbw * 8
+        let nz_ac = rec.nz_ac_mask & 0xffff
+        let nz_dc = rec.nz_dc_mask & 0xffff
+        let b: uint = 16
+        while b < 24 {
+            let block = b - 16
+            let at = (block < 4 ? YBR_B : YBR_R) + ((block & 3) >> 1) * 4 * YBR_STRIDE + (block & 1) * 4
+            let src = block < 4 ? this.u : this.v
+            let src_at = (this.mby * 8 + ((block & 3) >> 1) * 4) * c_stride + this.mbx * 8 + (block & 1) * 4
+            this.forward_dct(at, src, src_at, c_stride)
+            quantize_block(this.dct, levels, b * 16, 0, steps[4], steps[5], BIAS_UV_DC, BIAS_UV_AC)
+            dequantize_block(levels, b * 16, coeff, b * 16, steps[4], steps[5])
+            if has_levels(levels, b * 16, 0) : nz_ac = nz_ac | (1 << b)
+            if coeff[b * 16] != 0 : nz_dc = nz_dc | (1 << b)
+            b++
+        }
+        rec.nz_ac_mask = nz_ac
+        rec.nz_dc_mask = nz_dc
+        b = 16
+        while b < 24 {
+            let block = b - 16
+            rec.add_residual((block < 4 ? YBR_B : YBR_R) + ((block & 3) >> 1) * 4 * YBR_STRIDE + (block & 1) * 4, b * 16)
+            b++
+        }
+        let sink = this.sink
+        put_uv_mode(sink, mode)
+        put_chroma_tokens(sink, levels, 0, this.rec.left_nz >> 4, this.rec.up_nz[this.mbx] >> 4)
+        this.bits = sink.take_cost()
+        let src_at = this.mby * 8 * c_stride + this.mbx * 8
+        return this.distortion(YBR_B, this.u, src_at, c_stride, 8) + this.distortion(YBR_R, this.v, src_at, c_stride, 8)
+    }
+
+    // Where luma block `n` of the current macroblock starts in the source
+    fn luma_at(n: uint) uint {
+        let stride = this.mbw * 16
+        return (this.mby * 16 + (n >> 2) * 4) * stride + this.mbx * 16 + (n & 3) * 4
+    }
+
+    // The source minus the prediction in the work area, through libwebp's forward 4x4 DCT,
+    // into `dct` in raster order
+    fn forward_dct(at: uint, src: local &[u8], src_at: uint, stride: uint) {
+        let ybr = this.rec.ybr
+        let tmp = this.dct
+        let i: uint = 0
+        while i < 4 {
+            let s = src_at + i * stride
+            let r = at + i * YBR_STRIDE
+            let d0 = src[s].to(int) - ybr[r].to(int)
+            let d1 = src[s + 1].to(int) - ybr[r + 1].to(int)
+            let d2 = src[s + 2].to(int) - ybr[r + 2].to(int)
+            let d3 = src[s + 3].to(int) - ybr[r + 3].to(int)
+            let a0 = d0 + d3
+            let a1 = d1 + d2
+            let a2 = d1 - d2
+            let a3 = d0 - d3
+            tmp[i * 4] = (a0 + a1) * 8
+            tmp[i * 4 + 1] = (a2 * 2217 + a3 * 5352 + 1812) >> 9
+            tmp[i * 4 + 2] = (a0 - a1) * 8
+            tmp[i * 4 + 3] = (a3 * 2217 - a2 * 5352 + 937) >> 9
+            i++
+        }
+        i = 0
+        while i < 4 {
+            let a0 = tmp[i] + tmp[12 + i]
+            let a1 = tmp[4 + i] + tmp[8 + i]
+            let a2 = tmp[4 + i] - tmp[8 + i]
+            let a3 = tmp[i] - tmp[12 + i]
+            tmp[i] = (a0 + a1 + 7) >> 4
+            tmp[4 + i] = ((a2 * 2217 + a3 * 5352 + 12000) >> 16) + (a3 != 0 ? 1 : 0)
+            tmp[8 + i] = (a0 - a1 + 7) >> 4
+            tmp[12 + i] = (a3 * 2217 - a2 * 5352 + 51000) >> 16
+            i++
+        }
+    }
+
+    // The squared difference between the source and the work area over a square
+    fn distortion(at: uint, src: local &[u8], src_at: uint, stride: uint, size: uint) f64 {
+        let ybr = this.rec.ybr
+        let sum: int = 0
+        let j: uint = 0
+        while j < size {
+            let i: uint = 0
+            while i < size {
+                let d = src[src_at + j * stride + i].to(int) - ybr[at + j * YBR_STRIDE + i].to(int)
+                sum += d * d
+                i++
+            }
+            j++
+        }
+        return sum.to(f64)
+    }
+}
+
+// Where luma block `n` sits in the work area
+fn n_at(n: uint) uint {
+    return YBR_Y + (n >> 2) * 4 * YBR_STRIDE + (n & 3) * 4
+}
+
+// The luma blocks of a macroblock; returns the left contexts in the low 4 bits and the above
+// contexts in the next 4
+fn put_luma_tokens(sink: Vp8Sink, levels: local &[i16], at: uint, i16: bool, left: uint, up: uint) uint {
+    let plane: uint = i16 ? PLANE_Y1_WITH_Y2 : PLANE_Y1_SANS_Y2
+    let start: uint = i16 ? 1 : 0
+    let lnz = left & 0xf
+    let unz = up & 0xf
+    let y: uint = 0
+    while y < 4 {
+        let nz = (lnz >> y) & 1
+        let x: uint = 0
+        while x < 4 {
+            nz = put_tokens(sink, levels, at + (y * 4 + x) * 16, start, plane, nz + ((unz >> x) & 1))
+            unz = (unz & (0xf ^ (1 << x))) | (nz << x)
+            x++
+        }
+        lnz = (lnz & (0xf ^ (1 << y))) | (nz << y)
+        y++
+    }
+    return lnz | (unz << 4)
+}
+
+// The chroma blocks, with the contexts of both planes in 4 bits (U low, V high); returns the
+// left contexts in the low 4 bits and the above ones in the next 4
+fn put_chroma_tokens(sink: Vp8Sink, levels: local &[i16], at: uint, left: uint, up: uint) uint {
+    let lnz = left & 0xf
+    let unz = up & 0xf
+    let c: uint = 0
+    while c < 4 {
+        let block = 16 + c * 2
+        let y: uint = 0
+        while y < 2 {
+            let nz = (lnz >> (y + c)) & 1
+            let x: uint = 0
+            while x < 2 {
+                nz = put_tokens(sink, levels, at + (block + y * 2 + x) * 16, 0, PLANE_UV, nz + ((unz >> (x + c)) & 1))
+                unz = (unz & (0xf ^ (1 << (x + c)))) | (nz << (x + c))
+                x++
+            }
+            lnz = (lnz & (0xf ^ (1 << (y + c)))) | (nz << (y + c))
+            y++
+        }
+        c += 2
+    }
+    return lnz | (unz << 4)
+}
+
+// libwebp's second-order transform of the 16 luma DCs (raster block order) into `out`
+fn forward_wht(dc: local &[int], out: mut &[int]) {
+    let tmp = [int]{ 0 x 16 }
+    let i: uint = 0
+    while i < 4 {
+        let a0 = dc[i * 4] + dc[i * 4 + 2]
+        let a1 = dc[i * 4 + 1] + dc[i * 4 + 3]
+        let a2 = dc[i * 4 + 1] - dc[i * 4 + 3]
+        let a3 = dc[i * 4] - dc[i * 4 + 2]
+        tmp[i * 4] = a0 + a1
+        tmp[i * 4 + 1] = a3 + a2
+        tmp[i * 4 + 2] = a3 - a2
+        tmp[i * 4 + 3] = a0 - a1
+        i++
+    }
+    i = 0
+    while i < 4 {
+        let a0 = tmp[i] + tmp[8 + i]
+        let a1 = tmp[4 + i] + tmp[12 + i]
+        let a2 = tmp[4 + i] - tmp[12 + i]
+        let a3 = tmp[i] - tmp[8 + i]
+        out[i] = (a0 + a1) >> 1
+        out[4 + i] = (a3 + a2) >> 1
+        out[8 + i] = (a3 - a2) >> 1
+        out[12 + i] = (a0 - a1) >> 1
+        i++
+    }
+}
+
+// Levels in zigzag order from raster coefficients, rounded by `bias`/256 of a step; those
+// before `start` are 0
+fn quantize_block(coeffs: local &[int], levels: mut &[i16], at: uint, start: uint, dc_step: int, ac_step: int, dc_bias: int, ac_bias: int) {
+    let n: uint = 0
+    while n < 16 {
+        if n < start {
+            levels[at + n] = 0
+            n++
+            continue
+        }
+        let c = coeffs[zigzag4[n].to(uint)]
+        let step = n == 0 ? dc_step : ac_step
+        let bias = n == 0 ? dc_bias : ac_bias
+        let magnitude = c < 0 ? 0 - c : c
+        let level = (magnitude * 256 + bias * step) / (256 * step)
+        if level > MAX_LEVEL : level = MAX_LEVEL
+        levels[at + n] = (c < 0 ? 0 - level : level).to(i16)
+        n++
+    }
+}
+
+// Levels back to coefficients as the decoder scales them, in raster order
+fn dequantize_block(levels: local &[i16], at: uint, coeff: mut &[int], to: uint, dc_step: int, ac_step: int) {
+    let n: uint = 0
+    while n < 16 {
+        coeff[to + zigzag4[n].to(uint)] = levels[at + n].to(int) * (n == 0 ? dc_step : ac_step)
+        n++
+    }
+}
+
+fn has_levels(levels: local &[i16], at: uint, start: uint) bool {
+    let n = start
+    while n < 16 {
+        if levels[at + n] != 0 : return true
+        n++
+    }
+    return false
+}
+
+fn copy_levels(from: local &[i16], from_at: uint, to: mut &[i16], to_at: uint, count: uint) {
+    let i: uint = 0
+    while i < count {
+        to[to_at + i] = from[from_at + i]
+        i++
+    }
+}

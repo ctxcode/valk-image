@@ -13,13 +13,18 @@ test "Files: write and read a PNG by path" {
     image.read("/nonexistent/none.png") ! assert(E.code == E.invalid)
 }
 
-test "Files: the extension picks JPEG, GIF and BMP" {
+test "Files: the extension picks JPEG, WebP, GIF and BMP" {
     let img = image.Image.new(9, 7, 3) !!
     img.set_pixel(4, 3, .{ 200, 100, 50 })
     let dir = fs.exe_dir() !? "."
     let jpg = fs.add(dir, "image-test-round-trip.jpg")
     let bmp = fs.add(dir, "image-test-round-trip.bmp")
     let gif = fs.add(dir, "image-test-round-trip.gif")
+    let webp = fs.add(dir, "image-test-round-trip.webp")
+    img.write(webp) !!
+    let from_webp = image.read(webp) !!
+    assert(from_webp.width == 9 && from_webp.height == 7)
+    fs.delete_file(webp) ! {}
     img.write(jpg) !!
     img.write(bmp) !!
     img.write(gif) !!

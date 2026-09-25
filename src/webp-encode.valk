@@ -49,26 +49,31 @@ extend Image {
         bits.write(this.height - 1, 14)
         bits.write(has_alpha ? 1 : 0, 1)
         bits.write(0, 3)
-        // The header fills 5 bytes, so each way of coding the rest can start a writer of its own
-        let palette = LlPalette.find(argb)
-        let body: ?ByteBuffer = null
-        if isset(palette) {
-            let indexed = LlWriter { out: ByteBuffer.new(this.width * this.height / 2 + 64) }
-            write_indexed(indexed, argb, this.width, this.height, palette)
-            indexed.flush()
-            body = indexed.out
-        }
-        // A palette packed into fewer bits per pixel wins anyway; above that, predictors can
-        // beat it, as for a gray photo
-        if !isset(palette) || palette.count > 16 {
-            let predicted = LlWriter { out: ByteBuffer.new(this.width * this.height / 2 + 64) }
-            write_predicted(predicted, argb, this.width, this.height)
-            predicted.flush()
-            if !isset(body) || predicted.out.length < body.length : body = predicted.out
-        }
-        if isset(body) : bits.out.write(body)
+        bits.out.write(lossless_stream(argb, this.width, this.height))
         return webp_file("VP8L", bits.out)
     }
+}
+
+// The transforms and pixels of a lossless image, without the header: coded with a palette, or
+// with predictors, whichever is smaller. Changes `argb`.
+fn lossless_stream(argb: mut &[uint], width: uint, height: uint) ByteBuffer {
+    let palette = LlPalette.find(argb)
+    let best: ?ByteBuffer = null
+    if isset(palette) {
+        let indexed = LlWriter { out: ByteBuffer.new(width * height / 2 + 64) }
+        write_indexed(indexed, argb, width, height, palette)
+        indexed.flush()
+        best = indexed.out
+    }
+    // A palette packed into fewer bits per pixel wins anyway; above that, predictors can beat
+    // it, as for a gray photo
+    if !isset(palette) || palette.count > 16 {
+        let predicted = LlWriter { out: ByteBuffer.new(width * height / 2 + 64) }
+        write_predicted(predicted, argb, width, height)
+        predicted.flush()
+        if !isset(best) || predicted.out.length < best.length : best = predicted.out
+    }
+    return best ?? ByteBuffer.new(0)
 }
 
 fn check_webp_size(width: uint, height: uint) !ImageError {
@@ -77,16 +82,20 @@ fn check_webp_size(width: uint, height: uint) !ImageError {
 
 // A RIFF WebP file holding one chunk
 fn webp_file(fourcc: String, data: local &[u8]) String {
-    let pad = data.length & 1
     let out = ByteBuffer.new(data.length + 21)
     out.write("RIFF")
-    out.write_u32_le((12 + data.length + pad).to(u32))
+    out.write_u32_le((12 + data.length + (data.length & 1)).to(u32))
     out.write("WEBP")
+    write_chunk(out, fourcc, data)
+    return out.into_string()
+}
+
+// A RIFF chunk, padded to an even size
+fn write_chunk(out: ByteBuffer, fourcc: String, data: local &[u8]) {
     out.write(fourcc)
     out.write_u32_le(data.length.to(u32))
     out.write(data)
-    if pad == 1 : out.write_byte(0)
-    return out.into_string()
+    if (data.length & 1) == 1 : out.write_byte(0)
 }
 
 // Bits, least significant first

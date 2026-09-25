@@ -164,3 +164,46 @@ test "WebP: lossless writing limits code lengths" {
     let wide = image.Image.new(16385, 1, 1) !!
     wide.encode_webp_lossless() ! assert(E.code == E.range)
 }
+
+test "WebP: lossy writing" {
+    // The decoder is bit-exact with libwebp, and libwebp reads these files the same way
+    let photo = image.decode_png(asset("photo.png")) !!
+    let rgb = photo.to_rgb()
+    let best = photo.encode_webp(100) !!
+    let good = photo.encode_webp(90) !!
+    let low = photo.encode_webp(10) !!
+    let back = image.decode_webp(good) !!
+    assert(back.channels == 3 && back.width == 37 && back.height == 29)
+    assert(mean_diff(back, rgb) < 5.0)
+    // Lower quality: fewer bytes, further off
+    assert(low.bytes < good.bytes && good.bytes < best.bytes)
+    assert(mean_diff(image.decode_webp(low) !!, rgb) > mean_diff(image.decode_webp(best) !!, rgb))
+    // Gray, sizes that are not whole macroblocks, one pixel, one colour
+    let gray = image.decode_png(asset("photo-gray.png")) !!
+    assert(mean_diff(image.decode_webp(gray.encode_webp() !!) !!, gray.to_rgb()) < 4.0)
+    let odd = photo.crop(3, 2, 17, 9) !!
+    let odd_back = image.decode_webp(odd.encode_webp() !!) !!
+    assert(odd_back.width == 17 && odd_back.height == 9 && mean_diff(odd_back, odd.to_rgb()) < 7.0)
+    let one = photo.crop(5, 5, 1, 1) !!
+    assert(mean_diff(image.decode_webp(one.encode_webp() !!) !!, one.to_rgb()) < 3.0)
+    let flat = image.Image.new(100, 70, 3) !!
+    let flat_data = flat.encode_webp() !!
+    assert(flat_data.bytes < 100 && mean_diff(image.decode_webp(flat_data) !!, flat) == 0.0)
+}
+
+test "WebP: lossy writing keeps alpha exactly" {
+    let rgba = (image.decode_png(asset("photo.png")) !!).to_rgba()
+    each rgba.pixels as _, i : if i % 4 == 3 : rgba.pixels[i] = ((i * 7) & 255).to(u8)
+    let back = image.decode_webp(rgba.encode_webp() !!) !!
+    assert(back.channels == 4)
+    let i: uint = 3
+    while i < rgba.pixels.length {
+        assert(back.pixels[i] == rgba.pixels[i])
+        i += 4
+    }
+    // Opaque alpha needs no alpha chunk
+    let opaque = (image.decode_png(asset("photo.png")) !!).to_rgba()
+    assert((image.decode_webp(opaque.encode_webp() !!) !!).channels == 3)
+    let wide = image.Image.new(16384, 1, 1) !!
+    wide.encode_webp() ! assert(E.code == E.range)
+}

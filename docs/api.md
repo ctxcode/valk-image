@@ -118,6 +118,8 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn encode_png(level: uint (6)) String
     // Writes the image as PNG to `out` and returns the bytes written; see `encode_png`.
     + fn encode_png_into(out: Writer, level: uint (6)) uint !io:IoError
+    // Encodes the image as a lossy WebP at `quality`, from 0 (smallest) to 100 (best).
+    + fn encode_webp(quality: uint (75)) String !ImageError
     // Encodes the image as a lossless WebP: every pixel, and the alpha of an RGBA image, is kept exactly.
     + fn encode_webp_lossless() String !ImageError
     // Returns the largest image that fits inside `width` by `height` with the same proportions; an image that already fits is returned unchanged.
@@ -156,7 +158,7 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn to_rgb() Image
     // Returns a four-channel copy; the added alpha is opaque.
     + fn to_rgba() Image
-    // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.gif` or `.bmp`) and writes it there, with each encoder's defaults.
+    // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.webp`, `.gif` or `.bmp`) and writes it there, with each encoder's defaults; WebP is lossy.
     + fn write(path: String) void !ImageError
 }
 ```

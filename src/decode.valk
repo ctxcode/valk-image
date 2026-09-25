@@ -22,13 +22,14 @@ use valk.fs
 }
 
 extend Image {
-    /// Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.gif` or
-    /// `.bmp`) and writes it there, with each encoder's defaults.
+    /// Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.webp`, `.gif`
+    /// or `.bmp`) and writes it there, with each encoder's defaults; WebP is lossy.
     + fn write(path: String) !ImageError {
         let ext = fs.extension(path).lower()
         let data = ""
         if ext == "png" : data = this.encode_png()
         else if ext == "jpg" || ext == "jpeg" : data = this.encode_jpeg()
+        else if ext == "webp" : data = this.encode_webp() !>
         else if ext == "gif" : data = this.encode_gif() !>
         else if ext == "bmp" : data = this.encode_bmp()
         else : throw .unsupported { message: "Writing ." + ext + " files" }
