@@ -118,6 +118,8 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn encode_png(level: uint (6)) String
     // Writes the image as PNG to `out` and returns the bytes written; see `encode_png`.
     + fn encode_png_into(out: Writer, level: uint (6)) uint !io:IoError
+    // Encodes the image as a lossless WebP: every pixel, and the alpha of an RGBA image, is kept exactly.
+    + fn encode_webp_lossless() String !ImageError
     // Returns the largest image that fits inside `width` by `height` with the same proportions; an image that already fits is returned unchanged.
     + fn fit(width: uint, height: uint, filter: Filter (Filter.lanczos)) Image !ImageError
     // Returns the image mirrored left to right.

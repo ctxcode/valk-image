@@ -1,8 +1,8 @@
 # valk-image
 
 Image decoding, encoding and processing for [Valk](https://valk-lang.dev), written in
-pure Valk. Reads PNG, JPEG, WebP, GIF and BMP, writes PNG, JPEG, GIF and BMP; resizes,
-crops, flips and rotates.
+pure Valk. Reads PNG, JPEG, WebP, GIF and BMP, writes PNG, JPEG, lossless WebP, GIF and
+BMP; resizes, crops, flips and rotates.
 
 ## Install
 
@@ -58,6 +58,7 @@ can fail throw `ImageError`, with the reason in `E.message`.
 | `image.jpeg_orientation(data)` | The EXIF orientation tag, 1 to 8 |
 | `img.encode_png(level (6))` | PNG bytes; `level` is the compression level 0-9 |
 | `img.encode_jpeg(quality (85), subsample_chroma (true))` | JPEG bytes; quality 1-100 |
+| `img.encode_webp_lossless()` | Lossless WebP bytes, alpha included |
 | `img.encode_gif(dither (true))` | GIF bytes; more than 256 colours are reduced to 256 |
 | `anim.encode_gif(dither (true))` | An animated GIF |
 | `img.encode_bmp()` | BMP bytes |
@@ -69,7 +70,7 @@ The PNG, JPEG and BMP encoders have an `encode_*_into(writer)` twin that writes 
 |---|---|---|
 | PNG | all bit depths and color types, palettes, transparency, interlaced | 8-bit gray, RGB, RGBA |
 | JPEG | baseline and progressive, any chroma sampling, turned upright by EXIF orientation | baseline gray or YCbCr |
-| WebP | lossless and lossy, with alpha; not animations | - |
+| WebP | lossless and lossy, with alpha; not animations | lossless, with alpha |
 | GIF | still and animated, interlaced, transparency, local color tables | still and animated, transparency |
 | BMP | uncompressed 1 to 32-bit, including bit-field masks | 8-bit gray, 24-bit RGB, 32-bit RGBA |
 

@@ -1,0 +1,926 @@
+use valk.math
+
+// ---------------------------------------------------------------------------------------
+// VP8L (lossless) encoder: a palette or subtract-green plus predictors, then greedy LZ77 with
+// a color cache under one group of Huffman codes
+
+// Predictor blocks are 16x16
+value PREDICTOR_BITS (4)
+// Color transform blocks are 32x32
+value COLOR_BITS (5)
+// LZ77 limits: the longest copy the format takes, the shortest worth it for a nearby pixel
+// (which has a short distance code) and a far one, the farthest distance its 40 distance
+// codes reach, and how many earlier positions a search tries
+value COPY_MAX (4096)
+value COPY_MIN_NEAR (4)
+value COPY_MIN_FAR (8)
+value COPY_WINDOW (1048576 - 120)
+value COPY_TRIES (32)
+value HASH_BITS (16)
+// In a list of references: a copy, a color cache hit, else a literal ARGB pixel
+value REF_COPY (0x4000000000000000)
+value REF_CACHE (0x2000000000000000)
+
+extend Image {
+    /// Encodes the image as a lossless WebP: every pixel, and the alpha of an RGBA image, is
+    /// kept exactly.
+    ///
+    /// Throws `range` when a side exceeds 16384 pixels, the format's limit.
+    + fn encode_webp_lossless() String !ImageError {
+        check_webp_size(this.width, this.height) !>
+        let argb = [uint]{ 0 x this.width * this.height }
+        let c = this.channels.to(uint)
+        let pixels = this.pixels
+        let has_alpha = false
+        each argb as _, i {
+            let p = i * c
+            if c == 1 {
+                let v = pixels[p].to(uint)
+                argb[i] = 0xff000000 | (v << 16) | (v << 8) | v
+                continue
+            }
+            let alpha: uint = c == 4 ? pixels[p + 3].to(uint) : 255
+            if alpha != 255 : has_alpha = true
+            argb[i] = (alpha << 24) | (pixels[p].to(uint) << 16) | (pixels[p + 1].to(uint) << 8) | pixels[p + 2].to(uint)
+        }
+        let bits = LlWriter { out: ByteBuffer.new(this.pixels.length / 2 + 64) }
+        bits.write(VP8L_SIGNATURE, 8)
+        bits.write(this.width - 1, 14)
+        bits.write(this.height - 1, 14)
+        bits.write(has_alpha ? 1 : 0, 1)
+        bits.write(0, 3)
+        // The header fills 5 bytes, so each way of coding the rest can start a writer of its own
+        let palette = LlPalette.find(argb)
+        let body: ?ByteBuffer = null
+        if isset(palette) {
+            let indexed = LlWriter { out: ByteBuffer.new(this.width * this.height / 2 + 64) }
+            write_indexed(indexed, argb, this.width, this.height, palette)
+            indexed.flush()
+            body = indexed.out
+        }
+        // A palette packed into fewer bits per pixel wins anyway; above that, predictors can
+        // beat it, as for a gray photo
+        if !isset(palette) || palette.count > 16 {
+            let predicted = LlWriter { out: ByteBuffer.new(this.width * this.height / 2 + 64) }
+            write_predicted(predicted, argb, this.width, this.height)
+            predicted.flush()
+            if !isset(body) || predicted.out.length < body.length : body = predicted.out
+        }
+        if isset(body) : bits.out.write(body)
+        return webp_file("VP8L", bits.out)
+    }
+}
+
+fn check_webp_size(width: uint, height: uint) !ImageError {
+    if width > 16384 || height > 16384 : throw .range { message: "WebP images are limited to 16384 pixels per side" }
+}
+
+// A RIFF WebP file holding one chunk
+fn webp_file(fourcc: String, data: local &[u8]) String {
+    let pad = data.length & 1
+    let out = ByteBuffer.new(data.length + 21)
+    out.write("RIFF")
+    out.write_u32_le((12 + data.length + pad).to(u32))
+    out.write("WEBP")
+    out.write(fourcc)
+    out.write_u32_le(data.length.to(u32))
+    out.write(data)
+    if pad == 1 : out.write_byte(0)
+    return out.into_string()
+}
+
+// Bits, least significant first
+class LlWriter {
+    out: ByteBuffer
+    acc: uint (0)
+    count: uint (0)
+
+    fn write(value: uint, bits: uint) {
+        this.acc = this.acc | (value << this.count)
+        this.count += bits
+        while this.count >= 8 {
+            this.out.write_byte(this.acc.to(u8))
+            this.acc = this.acc >> 8
+            this.count -= 8
+        }
+    }
+    fn flush() {
+        if this.count > 0 : this.out.write_byte(this.acc.to(u8))
+        this.acc = 0
+        this.count = 0
+    }
+}
+
+// The palette, then the image as packed palette indexes
+fn write_indexed(bits: LlWriter, argb: local &[uint], width: uint, height: uint, palette: LlPalette) {
+    let colors = palette.count
+    bits.write(1, 1)
+    bits.write(TRANSFORM_COLOR_INDEXING, 2)
+    bits.write(colors - 1, 8)
+    // Each entry as its difference from the one before
+    let deltas = [uint]{ 0 x colors }
+    let i: uint = 0
+    while i < colors {
+        deltas[i] = i == 0 ? palette.colors[0] : sub_channels(palette.colors[i], palette.colors[i - 1])
+        i++
+    }
+    write_pixels(bits, deltas, colors, 1, false)
+    // Small palettes pack 2, 4 or 8 indexes into one pixel
+    let width_bits: uint = colors <= 2 ? 3 : (colors <= 4 ? 2 : (colors <= 16 ? 1 : 0))
+    let index_bits: uint = 8 >> width_bits
+    let packed_width = (width + (1 << width_bits) - 1) >> width_bits
+    let packed = [uint]{ 0xff000000 x packed_width * height }
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let index = palette.index_of(argb[y * width + x])
+            let shift = 8 + (x & ((1 << width_bits) - 1)) * index_bits
+            packed[y * packed_width + (x >> width_bits)] = packed[y * packed_width + (x >> width_bits)] | (index << shift)
+            x++
+        }
+        y++
+    }
+    bits.write(0, 1)
+    write_pixels(bits, packed, packed_width, height, true)
+}
+
+// Subtract-green, predictor and color transforms, then the residuals; changes `argb`
+fn write_predicted(bits: LlWriter, argb: mut &[uint], width: uint, height: uint) {
+    bits.write(1, 1)
+    bits.write(TRANSFORM_SUBTRACT_GREEN, 2)
+    each argb as pixel, i {
+        let green = (pixel >> 8) & 0xff
+        argb[i] = sub_channels(pixel, (green << 16) | green)
+    }
+    bits.write(1, 1)
+    bits.write(TRANSFORM_PREDICTOR, 2)
+    bits.write(PREDICTOR_BITS - 2, 3)
+    let block_width = (width + (1 << PREDICTOR_BITS) - 1) >> PREDICTOR_BITS
+    let block_height = (height + (1 << PREDICTOR_BITS) - 1) >> PREDICTOR_BITS
+    let cost = BlockCost.new()
+    let modes = choose_predictors(argb, width, height, cost)
+    write_pixels(bits, modes, block_width, block_height, false)
+    let residuals = predict_residuals(argb, modes, width, height)
+    bits.write(1, 1)
+    bits.write(TRANSFORM_COLOR, 2)
+    bits.write(COLOR_BITS - 2, 3)
+    // Multipliers change how values pair up, so they are judged by the code the whole image's
+    // residuals would get, not by their size
+    cost.learn(residuals)
+    let multipliers = choose_multipliers(residuals, width, height, cost)
+    write_pixels(bits, multipliers, (width + (1 << COLOR_BITS) - 1) >> COLOR_BITS, (height + (1 << COLOR_BITS) - 1) >> COLOR_BITS, false)
+    apply_multipliers(residuals, multipliers, width, height)
+    bits.write(0, 1)
+    write_pixels(bits, residuals, width, height, true)
+}
+
+// The colours of an image that has at most 256
+class LlPalette {
+    colors: mut &[uint] ([uint]{ 0 x 256 })
+    count: uint (0)
+    // An open-addressed table from colour + 1 to its index
+    keys: mut &[uint] ([uint]{ 0 x 1024 })
+    slots: mut &[u8] ([u8]{ 0 x 1024 })
+
+    static fn find(pixels: local &[uint]) ?SELF {
+        let palette = SELF {}
+        let last: uint = 1 << 40
+        each pixels as argb {
+            if argb == last : continue
+            last = argb
+            let slot = palette.slot(argb)
+            if palette.keys[slot] != 0 : continue
+            if palette.count == 256 : return null
+            palette.keys[slot] = argb + 1
+            palette.slots[slot] = palette.count.to(u8)
+            palette.colors[palette.count++] = argb
+        }
+        return palette
+    }
+    fn slot(argb: uint) uint {
+        let slot = ((argb * 2654435761) & 0xffffffff) >> 22
+        while this.keys[slot] != 0 && this.keys[slot] != argb + 1 : slot = (slot + 1) & 1023
+        return slot
+    }
+    fn index_of(argb: uint) uint {
+        return this.slots[this.slot(argb)].to(uint)
+    }
+}
+
+// `a - b` per channel
+fn sub_channels(a: uint, b: uint) uint {
+    let alpha_green = (0x100ff00ff + (a & 0xff00ff00) - (b & 0xff00ff00)) & 0xff00ff00
+    let red_blue = (0xff00ff00 + (a & 0x00ff00ff) - (b & 0x00ff00ff)) & 0x00ff00ff
+    return alpha_green | red_blue
+}
+
+// Roughly the bits of a residual: under a code for small differences to start with, then under
+// the code the image's own residuals would get
+class BlockCost {
+    table: mut &[f64] ([f64]{ 0 x 1024 })
+    sum: f64 (0)
+
+    static fn new() SELF {
+        let cost = SELF {}
+        let v: uint = 0
+        while v < 256 {
+            let d = v < 128 ? v : 256 - v
+            let bits = math.log2((1 + d).to(f64))
+            let c: uint = 0
+            while c < 4 {
+                cost.table[c * 256 + v] = bits
+                c++
+            }
+            v++
+        }
+        return cost
+    }
+    // Prices each value as the pixels' own histogram would, per channel
+    fn learn(pixels: local &[uint]) {
+        let counts = [uint]{ 0 x 1024 }
+        each pixels as argb {
+            counts[argb & 0xff]++
+            counts[256 + ((argb >> 8) & 0xff)]++
+            counts[512 + ((argb >> 16) & 0xff)]++
+            counts[768 + (argb >> 24)]++
+        }
+        let total = (pixels.length + 256).to(f64)
+        each counts as count, i : this.table[i] = math.log2(total / (count + 1).to(f64))
+    }
+    fn add(argb: uint) {
+        this.sum += this.table[argb & 0xff] + this.table[256 + ((argb >> 8) & 0xff)] + this.table[512 + ((argb >> 16) & 0xff)] + this.table[768 + (argb >> 24)]
+    }
+    // The cost of what was added, which then starts over
+    fn take() f64 {
+        let sum = this.sum
+        this.sum = 0
+        return sum
+    }
+}
+
+// Per block, the predictor whose residuals take the fewest bits, as the green of a pixel
+fn choose_predictors(argb: local &[uint], width: uint, height: uint, cost: BlockCost) mut &[uint] {
+    let size: uint = 1 << PREDICTOR_BITS
+    let blocks_per_row = (width + size - 1) >> PREDICTOR_BITS
+    let block_rows = (height + size - 1) >> PREDICTOR_BITS
+    let modes = [uint]{ 0 x blocks_per_row * block_rows }
+    let by: uint = 0
+    while by < block_rows {
+        let bx: uint = 0
+        while bx < blocks_per_row {
+            // The first row and column predict the same way whatever the mode
+            let x0 = bx * size > 0 ? bx * size : 1
+            let y0 = by * size > 0 ? by * size : 1
+            let x1 = (bx + 1) * size < width ? (bx + 1) * size : width
+            let y1 = (by + 1) * size < height ? (by + 1) * size : height
+            let best: uint = 0
+            let best_cost: f64 = 0
+            let mode: uint = 0
+            while mode < 14 {
+                let y = y0
+                while y < y1 {
+                    let x = x0
+                    while x < x1 {
+                        let at = y * width + x
+                        cost.add(sub_channels(argb[at], predict(mode, argb, at, width)))
+                        x++
+                    }
+                    y++
+                }
+                let bits = cost.take()
+                if mode == 0 || bits < best_cost {
+                    best = mode
+                    best_cost = bits
+                }
+                mode++
+            }
+            modes[by * blocks_per_row + bx] = 0xff000000 | (best << 8)
+            bx++
+        }
+        by++
+    }
+    return modes
+}
+
+// Every pixel minus its prediction, as the decoder predicts it
+fn predict_residuals(argb: local &[uint], modes: local &[uint], width: uint, height: uint) mut &[uint] {
+    let blocks_per_row = (width + (1 << PREDICTOR_BITS) - 1) >> PREDICTOR_BITS
+    let out = [uint]{ 0 x width * height }
+    out[0] = sub_channels(argb[0], 0xff000000)
+    let x: uint = 1
+    while x < width {
+        out[x] = sub_channels(argb[x], argb[x - 1])
+        x++
+    }
+    let y: uint = 1
+    while y < height {
+        let row = y * width
+        out[row] = sub_channels(argb[row], argb[row - width])
+        x = 1
+        while x < width {
+            let mode = (modes[(y >> PREDICTOR_BITS) * blocks_per_row + (x >> PREDICTOR_BITS)] >> 8) & 0xf
+            out[row + x] = sub_channels(argb[row + x], predict(mode, argb, row + x, width))
+            x++
+        }
+        y++
+    }
+    return out
+}
+
+// A signed channel
+fn signed(argb: uint, shift: uint) int {
+    return ((argb >> shift) & 0xff).to(u8).to(i8).to(int)
+}
+
+// Per block, the multipliers that best predict red from green and blue from green and red, by
+// least squares, as a pixel: green to red in blue, green to blue in green, red to blue in red
+fn choose_multipliers(residuals: local &[uint], width: uint, height: uint, cost: BlockCost) mut &[uint] {
+    let size: uint = 1 << COLOR_BITS
+    let blocks_per_row = (width + size - 1) >> COLOR_BITS
+    let block_rows = (height + size - 1) >> COLOR_BITS
+    let out = [uint]{ 0 x blocks_per_row * block_rows }
+    let by: uint = 0
+    while by < block_rows {
+        let bx: uint = 0
+        while bx < blocks_per_row {
+            let x1 = (bx + 1) * size < width ? (bx + 1) * size : width
+            let y1 = (by + 1) * size < height ? (by + 1) * size : height
+            let gg: int = 0
+            let gr: int = 0
+            let rr: int = 0
+            let bg: int = 0
+            let br: int = 0
+            let y = by * size
+            while y < y1 {
+                let x = bx * size
+                while x < x1 {
+                    let argb = residuals[y * width + x]
+                    let g = signed(argb, 8)
+                    let r = signed(argb, 16)
+                    let b = signed(argb, 0)
+                    gg += g * g
+                    gr += g * r
+                    rr += r * r
+                    bg += b * g
+                    br += b * r
+                    x++
+                }
+                y++
+            }
+            let green_to_red: int = gg > 0 ? (32 * gr) / gg : 0
+            let green_to_blue: int = gg > 0 ? (32 * bg) / gg : 0
+            let red_to_blue: int = 0
+            let det = gg * rr - gr * gr
+            if det > 0 {
+                green_to_blue = (32 * (bg * rr - br * gr)) / det
+                red_to_blue = (32 * (br * gg - bg * gr)) / det
+            }
+            // Least squares can lose to no multipliers at all, as when the channels are
+            // unrelated; red and blue are judged apart
+            let x0 = bx * size
+            let y0 = by * size
+            let red_part = clamp_multiplier(green_to_red)
+            if multiplier_cost(residuals, width, x0, y0, x1, y1, red_part, cost) >= multiplier_cost(residuals, width, x0, y0, x1, y1, 0, cost) : red_part = 0
+            let blue_part = (clamp_multiplier(red_to_blue) << 16) | (clamp_multiplier(green_to_blue) << 8)
+            if multiplier_cost(residuals, width, x0, y0, x1, y1, blue_part, cost) >= multiplier_cost(residuals, width, x0, y0, x1, y1, 0, cost) : blue_part = 0
+            let element = red_part | blue_part
+            out[by * blocks_per_row + bx] = 0xff000000 | element
+            bx++
+        }
+        by++
+    }
+    return out
+}
+
+// The bits of a block's red and blue after the multipliers
+fn multiplier_cost(residuals: local &[uint], width: uint, x0: uint, y0: uint, x1: uint, y1: uint, element: uint, cost: BlockCost) f64 {
+    let y = y0
+    while y < y1 {
+        let x = x0
+        while x < x1 {
+            cost.add(transform_color(residuals[y * width + x], element) & 0x00ff00ff)
+            x++
+        }
+        y++
+    }
+    return cost.take()
+}
+
+fn clamp_multiplier(value: int) uint {
+    let v = value < -128 ? -128 : (value > 127 ? 127 : value)
+    return (v & 0xff).to(uint)
+}
+
+// Takes from red and blue what the multipliers predict, as the decoder adds it back
+fn transform_color(argb: uint, element: uint) uint {
+    if element & 0xffffff == 0 : return argb
+    let green = (argb >> 8) & 0xff
+    let red = (argb >> 16) & 0xff
+    let new_red = (red.to(int) - color_delta(element & 0xff, green)) & 0xff
+    let new_blue = ((argb & 0xff).to(int) - color_delta((element >> 8) & 0xff, green) - color_delta((element >> 16) & 0xff, red)) & 0xff
+    return (argb & 0xff00ff00) | (new_red.to(uint) << 16) | new_blue.to(uint)
+}
+
+// Applies each block's multipliers
+fn apply_multipliers(residuals: mut &[uint], multipliers: local &[uint], width: uint, height: uint) {
+    let blocks_per_row = (width + (1 << COLOR_BITS) - 1) >> COLOR_BITS
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let element = multipliers[(y >> COLOR_BITS) * blocks_per_row + (x >> COLOR_BITS)]
+            residuals[y * width + x] = transform_color(residuals[y * width + x], element)
+            x++
+        }
+        y++
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Entropy-coded images
+
+// The pixels as literals and copies, the codes for them, then the coded pixels
+fn write_pixels(bits: LlWriter, pixels: local &[uint], width: uint, height: uint, is_main: bool) {
+    let refs = find_copies(pixels, width)
+    let cache_bits = is_main ? choose_cache_bits(pixels, refs) : 0
+    if cache_bits > 0 {
+        bits.write(1, 1)
+        bits.write(cache_bits, 4)
+    } else {
+        bits.write(0, 1)
+    }
+    // One group of codes for the whole image
+    if is_main : bits.write(0, 1)
+
+    let histograms = LlHistograms.new(cache_bits)
+    histograms.count(pixels, refs, cache_bits, true)
+    let green = EncodeCode.new(histograms.green)
+    let red = EncodeCode.new(histograms.red)
+    let blue = EncodeCode.new(histograms.blue)
+    let alpha = EncodeCode.new(histograms.alpha)
+    let distance = EncodeCode.new(histograms.distance)
+    green.write_lengths(bits)
+    red.write_lengths(bits)
+    blue.write_lengths(bits)
+    alpha.write_lengths(bits)
+    distance.write_lengths(bits)
+
+    each refs as ref {
+        if ref >= REF_COPY {
+            let length = (ref >> 32) & 0xffff
+            let distance_code = ref & 0xffffffff
+            let prefix = prefix_code(length)
+            green.write_symbol(bits, 256 + prefix)
+            bits.write((length - 1) & ((1 << prefix_extra_bits(prefix)) - 1), prefix_extra_bits(prefix))
+            let distance_prefix = prefix_code(distance_code)
+            distance.write_symbol(bits, distance_prefix)
+            bits.write((distance_code - 1) & ((1 << prefix_extra_bits(distance_prefix)) - 1), prefix_extra_bits(distance_prefix))
+        } else if ref >= REF_CACHE {
+            green.write_symbol(bits, 256 + LENGTH_CODES + (ref & 0xffff))
+        } else {
+            green.write_symbol(bits, (ref >> 8) & 0xff)
+            red.write_symbol(bits, (ref >> 16) & 0xff)
+            blue.write_symbol(bits, ref & 0xff)
+            alpha.write_symbol(bits, ref >> 24)
+        }
+    }
+}
+
+// The prefix code of a length or distance, the inverse of `read_prefixed`
+fn prefix_code(value: uint) uint {
+    let d = value - 1
+    if d < 4 : return d
+    let high: uint = 2
+    while (d >> (high + 1)) != 0 : high++
+    return 2 * high + ((d >> (high - 1)) & 1)
+}
+
+fn prefix_extra_bits(prefix: uint) uint {
+    return prefix < 4 ? 0 : (prefix - 2) >> 1
+}
+
+// The pixels as a list of literal pixels and copies of earlier ones, found greedily through
+// hash chains on pairs of pixels
+fn find_copies(pixels: local &[uint], width: uint) Array[uint] {
+    let n = pixels.length
+    let refs = Array[uint]{}
+    let heads = [u32]{ 0 x 1 << HASH_BITS }
+    let chain = [u32]{ 0 x n }
+    let codes = PlaneCodes.new(width)
+    let i: uint = 0
+    while i < n {
+        let best_length: uint = 0
+        let best_distance: uint = 0
+        let most = n - i < COPY_MAX ? n - i : COPY_MAX
+        if most >= COPY_MIN_NEAR {
+            // The pixel to the left and the one above first: their codes are the shortest
+            if i >= 1 {
+                best_length = copy_length(pixels, i - 1, i, most)
+                best_distance = 1
+            }
+            if i >= width && best_length < most {
+                let length = copy_length(pixels, i - width, i, most)
+                if length > best_length {
+                    best_length = length
+                    best_distance = width
+                }
+            }
+            let candidate = heads[pair_hash(pixels, i)].to(uint)
+            let tries: uint = 0
+            while candidate != 0 && tries < COPY_TRIES && best_length < most {
+                let from = candidate - 1
+                if i - from > COPY_WINDOW : break
+                let length = copy_length(pixels, from, i, most)
+                if length > best_length {
+                    best_length = length
+                    best_distance = i - from
+                }
+                candidate = chain[from].to(uint)
+                tries++
+            }
+        }
+        let code = best_length > 0 ? codes.code_of(best_distance) : 0
+        if best_length >= (code <= 120 ? COPY_MIN_NEAR : COPY_MIN_FAR) {
+            refs.append(REF_COPY | (best_length << 32) | code)
+            let end = i + best_length
+            while i < end {
+                if i + 1 < n : insert_pair(pixels, i, heads, chain)
+                i++
+            }
+            continue
+        }
+        refs.append(pixels[i])
+        if i + 1 < n : insert_pair(pixels, i, heads, chain)
+        i++
+    }
+    return refs
+}
+
+fn pair_hash(pixels: local &[uint], i: uint) uint {
+    let key = ((pixels[i] * 0x1e35a7bd) & 0xffffffff) ^ pixels[i + 1]
+    return ((key * 2654435761) & 0xffffffff) >> (32 - HASH_BITS)
+}
+
+fn insert_pair(pixels: local &[uint], i: uint, heads: mut &[u32], chain: mut &[u32]) {
+    let hash = pair_hash(pixels, i)
+    chain[i] = heads[hash]
+    heads[hash] = (i + 1).to(u32)
+}
+
+fn copy_length(pixels: local &[uint], from: uint, at: uint, most: uint) uint {
+    let length: uint = 0
+    while length < most && pixels[from + length] == pixels[at + length] : length++
+    return length
+}
+
+// The distance codes of an image width: the nearby pixels the first 120 codes name, and plain
+// distances plus 120 beyond them
+class PlaneCodes {
+    codes: mut &[u8]
+
+    static fn new(width: uint) SELF {
+        let codes = [u8]{ 0 x 7 * width + 9 }
+        let code: uint = 1
+        while code <= 120 {
+            let dx = distance_map[(code - 1) * 2].to(int)
+            let dy = distance_map[(code - 1) * 2 + 1].to(int)
+            let distance = dx + dy * width.to(int)
+            if distance >= 1 && distance.to(uint) < codes.length && codes[distance.to(uint)] == 0 : codes[distance.to(uint)] = code.to(u8)
+            code++
+        }
+        return SELF { codes: codes }
+    }
+    fn code_of(distance: uint) uint {
+        if distance < this.codes.length && this.codes[distance] != 0 : return this.codes[distance].to(uint)
+        return distance + 120
+    }
+}
+
+// Symbol counts for the five codes of a group
+class LlHistograms {
+    green: mut &[uint]
+    red: mut &[uint] ([uint]{ 0 x 256 })
+    blue: mut &[uint] ([uint]{ 0 x 256 })
+    alpha: mut &[uint] ([uint]{ 0 x 256 })
+    distance: mut &[uint] ([uint]{ 0 x DISTANCE_CODES })
+
+    static fn new(cache_bits: uint) SELF {
+        let cache_size: uint = cache_bits > 0 ? 1 << cache_bits : 0
+        return SELF { green: [uint]{ 0 x 256 + LENGTH_CODES + cache_size } }
+    }
+
+    // Counts the symbols of `refs` with a color cache of `cache_bits`; with `resolve`, the
+    // literals the cache holds become cache hits in `refs`
+    fn count(pixels: local &[uint], refs: Array[uint], cache_bits: uint, resolve: bool) {
+        let cache = [uint]{ 0 x (1 << cache_bits) }
+        let pos: uint = 0
+        each refs as ref, index {
+            if ref >= REF_COPY {
+                let length = (ref >> 32) & 0xffff
+                this.green[256 + prefix_code(length)]++
+                this.distance[prefix_code(ref & 0xffffffff)]++
+                if cache_bits > 0 {
+                    let k: uint = 0
+                    while k < length {
+                        let argb = pixels[pos + k]
+                        cache[cache_hash(argb, cache_bits)] = argb
+                        k++
+                    }
+                }
+                pos += length
+                continue
+            }
+            let argb = ref
+            pos++
+            if cache_bits > 0 {
+                let key = cache_hash(argb, cache_bits)
+                if cache[key] == argb {
+                    this.green[256 + LENGTH_CODES + key]++
+                    if resolve : refs[index] = REF_CACHE | key
+                    continue
+                }
+                cache[key] = argb
+            }
+            this.green[(argb >> 8) & 0xff]++
+            this.red[(argb >> 16) & 0xff]++
+            this.blue[argb & 0xff]++
+            this.alpha[argb >> 24]++
+        }
+    }
+
+    // Roughly how many bits the symbols take, and their codes
+    fn cost() f64 {
+        return entropy(this.green) + entropy(this.red) + entropy(this.blue) + entropy(this.alpha)
+    }
+}
+
+fn entropy(counts: local &[uint]) f64 {
+    let total: uint = 0
+    let used: uint = 0
+    let sum: f64 = 0
+    each counts as count {
+        if count == 0 : continue
+        total += count
+        used++
+        sum += count.to(f64) * math.log2(count.to(f64))
+    }
+    if used < 2 : return 0
+    // A few bits per stored code length
+    return total.to(f64) * math.log2(total.to(f64)) - sum + used.to(f64) * 4
+}
+
+// The color cache size, in bits, with the fewest estimated bits for the literals
+fn choose_cache_bits(pixels: local &[uint], refs: Array[uint]) uint {
+    let best: uint = 0
+    let best_cost: f64 = 0
+    let bits: uint = 0
+    while bits <= 10 {
+        let histograms = LlHistograms.new(bits)
+        histograms.count(pixels, refs, bits, false)
+        let cost = histograms.cost()
+        if bits == 0 || cost < best_cost {
+            best = bits
+            best_cost = cost
+        }
+        bits += 2
+    }
+    return best
+}
+
+// ---------------------------------------------------------------------------------------
+// Huffman codes
+
+// A canonical Huffman code for writing: its lengths and each symbol's bits in stream order
+class EncodeCode {
+    lengths: mut &[u8]
+    codes: mut &[u16]
+    // Symbols in use; a code with one takes no bits at all
+    used: uint (0)
+
+    static fn new(counts: local &[uint]) SELF {
+        let lengths = huffman_lengths(counts, 15)
+        return SELF.from_lengths(lengths)
+    }
+
+    static fn from_lengths(lengths: mut &[u8]) SELF {
+        let code = SELF { lengths: lengths, codes: [u16]{ 0 x lengths.length } }
+        let counts = [uint]{ 0 x 16 }
+        each lengths as length {
+            if length == 0 : continue
+            counts[length.to(uint)]++
+            code.used++
+        }
+        let next = [uint]{ 0 x 16 }
+        let first: uint = 0
+        let l: uint = 1
+        while l <= 15 {
+            next[l] = first
+            first = (first + counts[l]) << 1
+            l++
+        }
+        each lengths as length, symbol {
+            if length == 0 : continue
+            let len = length.to(uint)
+            code.codes[symbol] = reverse_bits(next[len], len).to(u16)
+            next[len]++
+        }
+        return code
+    }
+
+    fn write_symbol(bits: LlWriter, symbol: uint) {
+        if this.used < 2 : return
+        bits.write(this.codes[symbol].to(uint), this.lengths[symbol].to(uint))
+    }
+
+    // The code itself: one or two symbols spelled out, or code lengths under their own code
+    fn write_lengths(bits: LlWriter) {
+        let first: uint = 0
+        let second: uint = 0
+        let found: uint = 0
+        each this.lengths as length, symbol {
+            if length == 0 : continue
+            if found == 0 : first = symbol
+            else if found == 1 : second = symbol
+            found++
+        }
+        if found <= 2 && first < 256 && second < 256 {
+            bits.write(1, 1)
+            bits.write(found == 2 ? 1 : 0, 1)
+            if first < 2 {
+                bits.write(0, 1)
+                bits.write(first, 1)
+            } else {
+                bits.write(1, 1)
+                bits.write(first, 8)
+            }
+            if found == 2 : bits.write(second, 8)
+            return
+        }
+        bits.write(0, 1)
+        // Code lengths as symbols 0-15, 16 repeats the last non-zero length, 17 and 18 zeros
+        let tokens = Array[uint]{}
+        let token_counts = [uint]{ 0 x 19 }
+        let previous: u8 = 8
+        let i: uint = 0
+        let n = this.lengths.length
+        while i < n {
+            let value = this.lengths[i]
+            let run: uint = 1
+            while i + run < n && this.lengths[i + run] == value : run++
+            i += run
+            if value == 0 {
+                while run >= 11 {
+                    let part = run < 138 ? run : 138
+                    tokens.append(18 | ((part - 11) << 8))
+                    token_counts[18]++
+                    run -= part
+                }
+                if run >= 3 {
+                    tokens.append(17 | ((run - 3) << 8))
+                    token_counts[17]++
+                    run = 0
+                }
+                while run > 0 {
+                    tokens.append(0)
+                    token_counts[0]++
+                    run--
+                }
+                continue
+            }
+            if value != previous {
+                tokens.append(value.to(uint))
+                token_counts[value.to(uint)]++
+                previous = value
+                run--
+            }
+            while run >= 3 {
+                let part = run < 6 ? run : 6
+                tokens.append(16 | ((part - 3) << 8))
+                token_counts[16]++
+                run -= part
+            }
+            while run > 0 {
+                tokens.append(value.to(uint))
+                token_counts[value.to(uint)]++
+                run--
+            }
+        }
+        let length_code = SELF.from_lengths(huffman_lengths(token_counts, 7))
+        let stored: uint = 19
+        while stored > 4 && length_code.lengths[code_length_order[stored - 1].to(uint)] == 0 : stored--
+        bits.write(stored - 4, 4)
+        i = 0
+        while i < stored {
+            bits.write(length_code.lengths[code_length_order[i].to(uint)].to(uint), 3)
+            i++
+        }
+        // Lengths for the whole alphabet
+        bits.write(0, 1)
+        each tokens as token {
+            let symbol = token & 0xff
+            length_code.write_symbol(bits, symbol)
+            if symbol == 16 : bits.write(token >> 8, 2)
+            else if symbol == 17 : bits.write(token >> 8, 3)
+            else if symbol == 18 : bits.write(token >> 8, 7)
+        }
+    }
+}
+
+// Huffman code lengths of at most `limit` bits; unused symbols get 0, a lone symbol 1. A tree
+// that is too deep is rebuilt with the smallest counts raised until it fits.
+fn huffman_lengths(counts: local &[uint], limit: uint) mut &[u8] {
+    let lengths = [u8]{ 0 x counts.length }
+    let used: uint = 0
+    let last: uint = 0
+    each counts as count, symbol {
+        if count == 0 : continue
+        used++
+        last = symbol
+    }
+    if used == 0 : return lengths
+    if used == 1 {
+        lengths[last] = 1
+        return lengths
+    }
+    let nodes = 2 * used - 1
+    let keys = [uint]{ 0 x used }
+    let weights = [uint]{ 0 x nodes }
+    let parents = [uint]{ 0 x nodes }
+    let depths = [uint]{ 0 x nodes }
+    let floor: uint = 1
+    while true {
+        // Leaves by count, then symbol
+        let k: uint = 0
+        each counts as count, symbol {
+            if count == 0 : continue
+            keys[k++] = ((count > floor ? count : floor) << 16) | symbol
+        }
+        heap_sort(keys)
+        k = 0
+        while k < used {
+            weights[k] = keys[k] >> 16
+            k++
+        }
+        // Two queues: the sorted leaves, and the joined nodes, which come out sorted too
+        let leaf: uint = 0
+        let joined = used
+        let node = used
+        while node < nodes {
+            let a = leaf < used && (joined >= node || weights[leaf] <= weights[joined]) ? leaf++ : joined++
+            let b = leaf < used && (joined >= node || weights[leaf] <= weights[joined]) ? leaf++ : joined++
+            weights[node] = weights[a] + weights[b]
+            parents[a] = node
+            parents[b] = node
+            node++
+        }
+        depths[nodes - 1] = 0
+        let deepest: uint = 0
+        k = nodes - 1
+        while k > 0 {
+            k--
+            depths[k] = depths[parents[k]] + 1
+            if k < used && depths[k] > deepest : deepest = depths[k]
+        }
+        if deepest <= limit {
+            k = 0
+            while k < used {
+                lengths[keys[k] & 0xffff] = depths[k].to(u8)
+                k++
+            }
+            return lengths
+        }
+        floor = floor * 2
+    }
+}
+
+fn heap_sort(keys: mut &[uint]) {
+    let n = keys.length
+    let start = n / 2
+    while start > 0 {
+        start--
+        sift_down(keys, start, n)
+    }
+    let end = n
+    while end > 1 {
+        end--
+        let top = keys[0]
+        keys[0] = keys[end]
+        keys[end] = top
+        sift_down(keys, 0, end)
+    }
+}
+
+fn sift_down(keys: mut &[uint], start: uint, end: uint) {
+    let root = start
+    while 2 * root + 1 < end {
+        let child = 2 * root + 1
+        if child + 1 < end && keys[child + 1] > keys[child] : child++
+        if keys[root] >= keys[child] : return
+        let swap = keys[root]
+        keys[root] = keys[child]
+        keys[child] = swap
+        root = child
+    }
+}
+

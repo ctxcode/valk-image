@@ -53,3 +53,114 @@ test "WebP: unsupported and malformed files are reported" {
     image.decode_webp("not webp") ! assert(E.code == E.invalid)
     assert(!image.is_webp("RIFF"))
 }
+
+// Decoding the image's lossless encoding gives back every byte
+fn lossless_round_trip(img: image.Image) bool {
+    let back = image.decode_webp(img.encode_webp_lossless() !!) !!
+    let expected = img
+    if back.channels != img.channels : expected = back.channels == 4 ? img.to_rgba() : img.to_rgb()
+    return back.width == img.width && back.height == img.height && mem.equals(back.pixels, expected.pixels)
+}
+
+// Pseudo-random bytes
+class Noise {
+    state: u32 (2463534242)
+    fn next() uint {
+        let x = this.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 17)
+        x = x ^ (x << 5)
+        this.state = x
+        return x.to(uint)
+    }
+}
+
+// An image of `colors` colours in a scattered pattern
+fn scattered(width: uint, height: uint, colors: uint) image.Image {
+    let img = image.Image.new(width, height, 3) !!
+    let noise = Noise {}
+    let y: uint = 0
+    while y < height {
+        let x: uint = 0
+        while x < width {
+            let v = noise.next() % colors
+            img.set_pixel(x, y, .{ (v * 37).to(u8), (v * 91).to(u8), (255 - v).to(u8) })
+            x++
+        }
+        y++
+    }
+    return img
+}
+
+test "WebP: lossless writing keeps every pixel" {
+    // Predictors, with alpha, gray, a palette of 256
+    let photo = image.decode_png(asset("photo.png")) !!
+    assert(lossless_round_trip(photo))
+    let alpha = photo.to_rgba()
+    let y: uint = 0
+    while y < alpha.height {
+        let x: uint = 0
+        while x < alpha.width {
+            alpha.set(x, y, ((x * 7 + y * 3) & 255).to(u8), 3)
+            x++
+        }
+        y++
+    }
+    assert(lossless_round_trip(alpha))
+    let back = image.decode_webp(alpha.encode_webp_lossless() !!) !!
+    assert(back.channels == 4)
+    assert(lossless_round_trip(image.decode_png(asset("photo-gray.png")) !!))
+    assert(lossless_round_trip(image.decode_png(asset("gif-photo-ref.png")) !!))
+    // Palettes packed 8, 4 and 2 to a pixel, across widths that do not divide evenly
+    assert(lossless_round_trip(scattered(13, 7, 2)))
+    assert(lossless_round_trip(scattered(13, 7, 3)))
+    assert(lossless_round_trip(scattered(13, 7, 12)))
+    // Thin and tiny
+    assert(lossless_round_trip(scattered(1, 1, 1)))
+    assert(lossless_round_trip(photo.crop(0, 0, 1, 29) !!))
+    assert(lossless_round_trip(photo.crop(0, 5, 37, 1) !!))
+}
+
+test "WebP: lossless writing finds repeats" {
+    // One colour: copies of the longest length, a few bytes in all
+    let flat = image.Image.new(700, 700, 3) !!
+    let data = flat.encode_webp_lossless() !!
+    assert(data.bytes < 200)
+    assert(lossless_round_trip(flat))
+    // Noise rows repeated with a shift: copies from far back and from nearby rows
+    let rows = image.Image.new(300, 120, 4) !!
+    let noise = Noise {}
+    let first = [u8]{ 0 x 300 * 4 }
+    each first as _, i : first[i] = noise.next().to(u8)
+    let y: uint = 0
+    while y < 120 {
+        let x: uint = 0
+        while x < 300 * 4 {
+            rows.pixels[y * 300 * 4 + x] = first[(x + (y % 7) * 4) % (300 * 4)]
+            x++
+        }
+        y++
+    }
+    let packed = rows.encode_webp_lossless() !!
+    assert(packed.bytes < 300 * 4 * 3)
+    assert(lossless_round_trip(rows))
+    // Pure noise: nothing to copy
+    let random = image.Image.new(200, 150, 4) !!
+    each random.pixels as _, i : random.pixels[i] = noise.next().to(u8)
+    assert(lossless_round_trip(random))
+}
+
+test "WebP: lossless writing limits code lengths" {
+    // Colours drawn with halving odds make a Huffman tree deeper than the 15 bits allowed
+    let img = image.Image.new(256, 256, 1) !!
+    let noise = Noise {}
+    each img.pixels as _, i {
+        let r = noise.next()
+        let v: uint = 0
+        while v < 31 && (r >> v) & 1 == 0 : v++
+        img.pixels[i] = (v * 8).to(u8)
+    }
+    assert(lossless_round_trip(img))
+    let wide = image.Image.new(16385, 1, 1) !!
+    wide.encode_webp_lossless() ! assert(E.code == E.range)
+}

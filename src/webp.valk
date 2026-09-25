@@ -574,32 +574,35 @@ fn undo_predictor(pixels: local mut &[uint], transform: LlTransform, width: uint
         while x < width {
             let mode = (transform.data[(y >> bits) * blocks_per_row + (x >> bits)] >> 8) & 0xf
             let at = row + x
-            let left = pixels[at - 1]
-            let top = pixels[at - width]
-            let top_left = pixels[at - width - 1]
-            // For the last column this is the first pixel of the current row
-            let top_right = pixels[at - width + 1]
-            let predicted: uint = 0
-            if mode == 0 : predicted = 0xff000000
-            else if mode == 1 : predicted = left
-            else if mode == 2 : predicted = top
-            else if mode == 3 : predicted = top_right
-            else if mode == 4 : predicted = top_left
-            else if mode == 5 : predicted = average2(average2(left, top_right), top)
-            else if mode == 6 : predicted = average2(left, top_left)
-            else if mode == 7 : predicted = average2(left, top)
-            else if mode == 8 : predicted = average2(top_left, top)
-            else if mode == 9 : predicted = average2(top, top_right)
-            else if mode == 10 : predicted = average2(average2(left, top_left), average2(top, top_right))
-            else if mode == 11 : predicted = select_predictor(left, top, top_left)
-            else if mode == 12 : predicted = clamp_add_subtract_full(left, top, top_left)
-            else if mode == 13 : predicted = clamp_add_subtract_half(average2(left, top), top_left)
-            else : predicted = 0xff000000
-            pixels[at] = add_channels(pixels[at], predicted)
+            pixels[at] = add_channels(pixels[at], predict(mode, pixels, at, width))
             x++
         }
         y++
     }
+}
+
+// The prediction of predictor `mode` for the pixel at `at`, from the pixels before it; not for
+// the first row or column
+fn predict(mode: uint, pixels: local &[uint], at: uint, width: uint) uint $inline {
+    let left = pixels[at - 1]
+    let top = pixels[at - width]
+    let top_left = pixels[at - width - 1]
+    // For the last column this is the first pixel of the current row
+    let top_right = pixels[at - width + 1]
+    if mode == 1 : return left
+    if mode == 2 : return top
+    if mode == 3 : return top_right
+    if mode == 4 : return top_left
+    if mode == 5 : return average2(average2(left, top_right), top)
+    if mode == 6 : return average2(left, top_left)
+    if mode == 7 : return average2(left, top)
+    if mode == 8 : return average2(top_left, top)
+    if mode == 9 : return average2(top, top_right)
+    if mode == 10 : return average2(average2(left, top_left), average2(top, top_right))
+    if mode == 11 : return select_predictor(left, top, top_left)
+    if mode == 12 : return clamp_add_subtract_full(left, top, top_left)
+    if mode == 13 : return clamp_add_subtract_half(average2(left, top), top_left)
+    return 0xff000000
 }
 
 fn channel(argb: uint, shift: uint) int {
