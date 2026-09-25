@@ -9,18 +9,22 @@ test "Files: write and read a PNG by path" {
     let back = image.read(path) !!
     assert(back.get(1, 1, 2) == 3 && back.get(1, 1, 3) == 4 && back.get(0, 0, 3) == 0)
     fs.delete_file(path) ! {}
-    img.write("x.gif") ! assert(E.code == E.unsupported)
+    img.write("x.tiff") ! assert(E.code == E.unsupported)
     image.read("/nonexistent/none.png") ! assert(E.code == E.invalid)
 }
 
-test "Files: the extension picks JPEG and BMP" {
+test "Files: the extension picks JPEG, GIF and BMP" {
     let img = image.Image.new(9, 7, 3) !!
     img.set_pixel(4, 3, .{ 200, 100, 50 })
     let dir = fs.exe_dir() !? "."
     let jpg = fs.add(dir, "image-test-round-trip.jpg")
     let bmp = fs.add(dir, "image-test-round-trip.bmp")
+    let gif = fs.add(dir, "image-test-round-trip.gif")
     img.write(jpg) !!
     img.write(bmp) !!
+    img.write(gif) !!
+    let from_gif = image.read(gif) !!
+    assert(from_gif.width == 9 && from_gif.get(4, 3, 1) == 100 && from_gif.get(0, 0, 1) == 0)
     let from_jpg = image.read(jpg) !!
     let from_bmp = image.read(bmp) !!
     assert(from_jpg.width == 9 && from_jpg.height == 7 && from_jpg.channels == 3)
@@ -30,4 +34,5 @@ test "Files: the extension picks JPEG and BMP" {
     assert(from_jpg.get(4, 3, 0) > from_jpg.get(0, 0, 0) + 30)
     fs.delete_file(jpg) ! {}
     fs.delete_file(bmp) ! {}
+    fs.delete_file(gif) ! {}
 }

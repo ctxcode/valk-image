@@ -1,0 +1,355 @@
+// Pixels with less alpha than this are transparent in a palette image
+value ALPHA_CUTOFF (128)
+
+// A rectangle of an image
+class Region {
+    x: uint
+    y: uint
+    width: uint
+    height: uint
+}
+
+// The colours of a region, at most 256, and the palette index of each of its pixels
+class Indexed {
+    // RGB triples
+    palette: mut &[u8]
+    colors: uint
+    // The index of transparent pixels, or -1 when there are none
+    transparent: int (-1)
+    indexes: mut &[u8]
+}
+
+// The region's pixels as palette indexes: its own colours when there are few enough, else a
+// palette chosen by median cut
+fn quantize(img: Image, region: Region, dither: bool) Indexed {
+    let exact = exact_palette(img, region)
+    if isset(exact) : return exact
+    return reduce_palette(img, region, dither)
+}
+
+// The region's own colours, or null when there are more than a palette holds
+fn exact_palette(img: Image, region: Region) ?Indexed {
+    let c = img.channels.to(uint)
+    let pixels = img.pixels
+    // An open-addressed table from colour + 1 to its index
+    let keys = [u32]{ 0 x 1024 }
+    let slots = [u8]{ 0 x 1024 }
+    let palette = [u8]{ 0 x 768 }
+    let indexes = [u8]{ 0 x region.width * region.height }
+    let colors: uint = 0
+    let transparent = false
+    let last_key: u32 = 0
+    let last_index: u8 = 0
+    let at: uint = 0
+    let y: uint = 0
+    while y < region.height {
+        let p = img.offset(region.x, region.y + y)
+        let x: uint = 0
+        while x < region.width {
+            if c == 4 && pixels[p + 3] < ALPHA_CUTOFF {
+                // 255 until the colours are known; no colour takes it when there is transparency
+                transparent = true
+                indexes[at++] = 255
+                p += 4
+                x++
+                continue
+            }
+            let rgb = c == 1 ? pixels[p].to(uint) * 0x010101 : (pixels[p].to(uint) << 16) | (pixels[p + 1].to(uint) << 8) | pixels[p + 2].to(uint)
+            let key = (rgb + 1).to(u32)
+            if key != last_key {
+                let slot = ((rgb * 2654435761) >> 22) & 1023
+                while keys[slot] != 0 && keys[slot] != key : slot = (slot + 1) & 1023
+                if keys[slot] == 0 {
+                    if colors == 256 : return null
+                    keys[slot] = key
+                    slots[slot] = colors.to(u8)
+                    palette[colors * 3] = (rgb >> 16).to(u8)
+                    palette[colors * 3 + 1] = (rgb >> 8).to(u8)
+                    palette[colors * 3 + 2] = rgb.to(u8)
+                    colors++
+                }
+                last_key = key
+                last_index = slots[slot]
+            }
+            indexes[at++] = last_index
+            p += c
+            x++
+        }
+        y++
+    }
+    if !transparent : return Indexed { palette: palette, colors: colors, indexes: indexes }
+    if colors == 256 : return null
+    if colors < 255 {
+        let i: uint = 0
+        while i < indexes.length {
+            if indexes[i] == 255 : indexes[i] = colors.to(u8)
+            i++
+        }
+    }
+    return Indexed { palette: palette, colors: colors, transparent: colors.to(int), indexes: indexes }
+}
+
+// A box of the colour cube: a run of occupied histogram bins
+class ColorBox {
+    start: uint
+    end: uint
+    count: uint (0)
+    // The spread of its pixels, and the channel along which it is widest
+    error: f64 (0)
+    axis: uint (0)
+}
+
+// A 256-colour palette by median cut over a 15-bit histogram, with the pixels mapped to it
+fn reduce_palette(img: Image, region: Region, dither: bool) Indexed {
+    let c = img.channels.to(uint)
+    let pixels = img.pixels
+    let counts = [uint]{ 0 x 32768 }
+    let sums = [uint]{ 0 x 32768 * 3 }
+    let transparent = false
+    let y: uint = 0
+    while y < region.height {
+        let p = img.offset(region.x, region.y + y)
+        let x: uint = 0
+        while x < region.width {
+            if c == 4 && pixels[p + 3] < ALPHA_CUTOFF {
+                transparent = true
+            } else {
+                let r = pixels[p].to(uint)
+                let g = c == 1 ? r : pixels[p + 1].to(uint)
+                let b = c == 1 ? r : pixels[p + 2].to(uint)
+                let bin = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+                counts[bin]++
+                sums[bin * 3] += r
+                sums[bin * 3 + 1] += g
+                sums[bin * 3 + 2] += b
+            }
+            p += c
+            x++
+        }
+        y++
+    }
+
+    let occupied: uint = 0
+    each counts as count : if count > 0 : occupied++
+    let bins = [u16]{ 0 x occupied }
+    let sorted = [u16]{ 0 x occupied }
+    let n: uint = 0
+    each counts as count, bin {
+        if count > 0 : bins[n++] = bin.to(u16)
+    }
+
+    let limit: uint = transparent ? 255 : 256
+    let boxes = Array[ColorBox]{}
+    let starts = [uint]{ 0 x 33 }
+    if occupied > 0 : boxes.append(measure_box(ColorBox { start: 0, end: occupied }, bins, counts, sums))
+    while boxes.length < limit {
+        // Split the box whose pixels are furthest from its colour
+        let widest: ?ColorBox = null
+        each boxes as box {
+            if box.end - box.start < 2 : continue
+            if !isset(widest) || box.error > widest.error : widest = box
+        }
+        let box = widest ?! break
+        let split = split_box(box, bins, sorted, counts, starts)
+        let upper = ColorBox { start: split, end: box.end }
+        box.end = split
+        measure_box(box, bins, counts, sums)
+        boxes.append(measure_box(upper, bins, counts, sums))
+    }
+
+    let palette = [u8]{ 0 x 768 }
+    each boxes as box, i {
+        let r: uint = 0
+        let g: uint = 0
+        let b: uint = 0
+        let k = box.start
+        while k < box.end {
+            let bin = bins[k].to(uint)
+            r += sums[bin * 3]
+            g += sums[bin * 3 + 1]
+            b += sums[bin * 3 + 2]
+            k++
+        }
+        palette[i * 3] = ((r + box.count / 2) / box.count).to(u8)
+        palette[i * 3 + 1] = ((g + box.count / 2) / box.count).to(u8)
+        palette[i * 3 + 2] = ((b + box.count / 2) / box.count).to(u8)
+    }
+    let colors = boxes.length
+    let indexed = Indexed { palette: palette, colors: colors, transparent: transparent ? colors.to(int) : -1, indexes: [u8]{ 0 x region.width * region.height } }
+    map_pixels(img, region, indexed, dither)
+    return indexed
+}
+
+// The pixel count, spread and widest channel of a box
+fn measure_box(box: ColorBox, bins: local &[u16], counts: local &[uint], sums: local &[uint]) ColorBox {
+    let count: uint = 0
+    let mr: f64 = 0
+    let mg: f64 = 0
+    let mb: f64 = 0
+    let k = box.start
+    while k < box.end {
+        let bin = bins[k].to(uint)
+        count += counts[bin]
+        mr += sums[bin * 3].to(f64)
+        mg += sums[bin * 3 + 1].to(f64)
+        mb += sums[bin * 3 + 2].to(f64)
+        k++
+    }
+    mr = mr / count.to(f64)
+    mg = mg / count.to(f64)
+    mb = mb / count.to(f64)
+    let sr: f64 = 0
+    let sg: f64 = 0
+    let sb: f64 = 0
+    k = box.start
+    while k < box.end {
+        let bin = bins[k].to(uint)
+        let weight = counts[bin].to(f64)
+        let dr = sums[bin * 3].to(f64) / weight - mr
+        let dg = sums[bin * 3 + 1].to(f64) / weight - mg
+        let db = sums[bin * 3 + 2].to(f64) / weight - mb
+        sr += dr * dr * weight
+        sg += dg * dg * weight
+        sb += db * db * weight
+        k++
+    }
+    box.count = count
+    box.error = sr + sg + sb
+    box.axis = sg >= sr && sg >= sb ? 1 : (sr >= sb ? 0 : 2)
+    return box
+}
+
+// Sorts the box's bins along its widest channel and returns where half its pixels lie.
+// `starts` is scratch space of 33 entries.
+fn split_box(box: ColorBox, bins: mut &[u16], sorted: mut &[u16], counts: local &[uint], starts: mut &[uint]) uint {
+    let shift: uint = box.axis == 0 ? 10 : (box.axis == 1 ? 5 : 0)
+    // A counting sort on the channel's 5 bits
+    let v: uint = 0
+    while v < 33 : starts[v++] = 0
+    let k = box.start
+    while k < box.end {
+        starts[((bins[k].to(uint) >> shift) & 31) + 1]++
+        k++
+    }
+    v = 1
+    while v < 32 {
+        starts[v + 1] += starts[v]
+        v++
+    }
+    k = box.start
+    while k < box.end {
+        let value = (bins[k].to(uint) >> shift) & 31
+        sorted[box.start + starts[value]] = bins[k]
+        starts[value]++
+        k++
+    }
+    k = box.start
+    while k < box.end {
+        bins[k] = sorted[k]
+        k++
+    }
+    // Both halves keep at least one bin
+    let half = box.count / 2
+    k = box.start
+    let seen = counts[bins[k].to(uint)]
+    while seen < half && k + 2 < box.end {
+        k++
+        seen += counts[bins[k].to(uint)]
+    }
+    return k + 1
+}
+
+// Maps every pixel to the nearest palette colour, spreading the difference to the pixels not
+// yet mapped (Floyd–Steinberg, alternating direction per row) when `dither` is set
+fn map_pixels(img: Image, region: Region, indexed: Indexed, dither: bool) {
+    let c = img.channels.to(uint)
+    let pixels = img.pixels
+    let palette = indexed.palette
+    let colors = indexed.colors
+    let indexes = indexed.indexes
+    let transparent = indexed.transparent
+    // The nearest colour per 15-bit bin, found on first use
+    let nearest = [u16]{ 0xFFFF x 32768 }
+    let width = region.width
+    // Errors in sixteenths for this row and the next, one pixel of margin on each side
+    let current = [int]{ 0 x (width + 2) * 3 }
+    let next = [int]{ 0 x (width + 2) * 3 }
+    let y: uint = 0
+    while y < region.height {
+        let reverse = dither && (y & 1) == 1
+        let row = img.offset(region.x, region.y + y)
+        let step: uint = 0
+        while step < width {
+            let x = reverse ? width - 1 - step : step
+            step++
+            let p = row + x * c
+            if c == 4 && pixels[p + 3] < ALPHA_CUTOFF {
+                indexes[y * width + x] = transparent.to(u8)
+                continue
+            }
+            let r = pixels[p].to(int)
+            let g = c == 1 ? r : pixels[p + 1].to(int)
+            let b = c == 1 ? r : pixels[p + 2].to(int)
+            let e = (x + 1) * 3
+            if dither {
+                r = clamp_channel(r + (current[e] + 8) / 16).to(int)
+                g = clamp_channel(g + (current[e + 1] + 8) / 16).to(int)
+                b = clamp_channel(b + (current[e + 2] + 8) / 16).to(int)
+            }
+            let bin = ((r.to(uint) >> 3) << 10) | ((g.to(uint) >> 3) << 5) | (b.to(uint) >> 3)
+            let index = nearest[bin].to(uint)
+            if index == 0xFFFF {
+                index = nearest_color(palette, colors, bin)
+                nearest[bin] = index.to(u16)
+            }
+            indexes[y * width + x] = index.to(u8)
+            if !dither : continue
+            let dr = r - palette[index * 3].to(int)
+            let dg = g - palette[index * 3 + 1].to(int)
+            let db = b - palette[index * 3 + 2].to(int)
+            // Ahead in this row 7/16, behind below 3/16, below 5/16, ahead below 1/16
+            let ahead = reverse ? e - 3 : e + 3
+            let behind = reverse ? e + 3 : e - 3
+            current[ahead] += dr * 7
+            current[ahead + 1] += dg * 7
+            current[ahead + 2] += db * 7
+            next[behind] += dr * 3
+            next[behind + 1] += dg * 3
+            next[behind + 2] += db * 3
+            next[e] += dr * 5
+            next[e + 1] += dg * 5
+            next[e + 2] += db * 5
+            next[ahead] += dr
+            next[ahead + 1] += dg
+            next[ahead + 2] += db
+        }
+        let done = current
+        current = next
+        next = done
+        let i: uint = 0
+        while i < next.length : next[i++] = 0
+        y++
+    }
+}
+
+// The palette index closest to the centre of a 15-bit bin
+fn nearest_color(palette: local &[u8], colors: uint, bin: uint) uint {
+    let r = (((bin >> 10) & 31) << 3 | 4).to(int)
+    let g = (((bin >> 5) & 31) << 3 | 4).to(int)
+    let b = ((bin & 31) << 3 | 4).to(int)
+    let best: uint = 0
+    let best_distance: int = -1
+    let i: uint = 0
+    while i < colors {
+        let dr = r - palette[i * 3].to(int)
+        let dg = g - palette[i * 3 + 1].to(int)
+        let db = b - palette[i * 3 + 2].to(int)
+        let distance = dr * dr + dg * dg + db * db
+        if best_distance < 0 || distance < best_distance {
+            best = i
+            best_distance = distance
+        }
+        i++
+    }
+    return best
+}

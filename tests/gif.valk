@@ -69,3 +69,95 @@ test "GIF: truncated and malformed files" {
     image.decode_gif("not a gif") ! assert(E.code == E.invalid)
     assert(!image.is_gif("GIF90a"))
 }
+
+// A gray image of noise, which LZW cannot shorten: its table fills up and starts over
+fn noise(width: uint, height: uint) image.Image {
+    let img = image.Image.new(width, height, 1) !!
+    let seed: u32 = 12345
+    each img.pixels as _, i {
+        seed = seed * 1103515245 + 12345
+        img.pixels[i] = (seed >> 16).to(u8)
+    }
+    return img
+}
+
+test "GIF: writing keeps up to 256 colours exactly" {
+    // 256 colours, transparency, gray, and one colour
+    let photo = image.decode_png(asset("gif-photo-ref.png")) !!
+    assert(same_pixels(image.decode_gif(photo.encode_gif() !!) !!, photo))
+    let trans = image.decode_png(asset("gif-trans-ref.png")) !!
+    let back = image.decode_gif(trans.encode_gif() !!) !!
+    assert(back.channels == 4 && same_pixels(back, trans))
+    let gray = noise(300, 200)
+    assert(same_pixels(image.decode_gif(gray.encode_gif() !!) !!, gray))
+    let flat = image.Image.new(3, 2, 3) !!
+    assert(same_pixels(image.decode_gif(flat.encode_gif() !!) !!, flat))
+}
+
+test "GIF: writing reduces a photo to 256 colours" {
+    let photo = image.decode_png(asset("photo.png")) !!
+    let rgb = photo.to_rgb()
+    let plain = image.decode_gif(photo.encode_gif(false) !!) !!
+    assert(mean_diff(plain, rgb) < 4.0)
+    // Dithering is noisier pixel by pixel and closer on average over an area
+    let dithered = image.decode_gif(photo.encode_gif() !!) !!
+    let w = photo.width / 4
+    let h = photo.height / 4
+    let small = rgb.resize(w, h, image.Filter.box) !!
+    assert(mean_diff(dithered.resize(w, h, image.Filter.box) !!, small) < mean_diff(plain.resize(w, h, image.Filter.box) !!, small))
+}
+
+fn frame(img: image.Image, delay_ms: uint) image.Frame {
+    return image.Frame { image: img, delay_ms: delay_ms }
+}
+
+test "GIF: writing animations" {
+    // Transparent frames: each is cleared before the next
+    let anim = image.Animation { loops: 3 }
+    let i: uint = 0
+    while i < 4 {
+        anim.frames.append(frame(image.decode_png(asset("gif-anim-" + i + ".png")) !!, 200))
+        i++
+    }
+    let back = image.decode_gif_animation(anim.encode_gif() !!) !!
+    assert(back.frames.length == 4 && back.loops == 3)
+    each back.frames as f, k {
+        assert(f.delay_ms == 200)
+        assert(same_pixels(f.image, anim.frames.get(k) !!.image))
+    }
+
+    // Opaque frames: only what changed is stored; a frame may repeat the previous one
+    let photo = image.decode_png(asset("gif-photo-ref.png")) !!
+    let painted = photo.clone()
+    let y: uint = 10
+    while y < 14 {
+        let x: uint = 5
+        while x < 12 {
+            painted.set_pixel(x, y, .{ photo.get(0, 0, 0), photo.get(0, 0, 1), photo.get(0, 0, 2) })
+            x++
+        }
+        y++
+    }
+    let opaque = image.Animation { frames: .{ frame(photo, 120), frame(painted, 34), frame(painted.clone(), 0) } }
+    let data = opaque.encode_gif() !!
+    assert(data.bytes < (photo.encode_gif() !!).bytes + 200)
+    let played = image.decode_gif_animation(data) !!
+    assert(played.frames.length == 3 && played.loops == 0)
+    assert(same_pixels(played.frames.get(0) !!.image, photo))
+    assert(same_pixels(played.frames.get(1) !!.image, painted))
+    assert(same_pixels(played.frames.get(2) !!.image, painted))
+    // Delays are stored in hundredths of a second
+    assert(played.frames.get(0) !!.delay_ms == 120 && played.frames.get(1) !!.delay_ms == 30 && played.frames.get(2) !!.delay_ms == 0)
+
+    // Played once: no loop block, which reads back as one play
+    let once = image.Animation { frames: .{ frame(photo, 10) }, loops: 1 }
+    assert((image.decode_gif_animation(once.encode_gif() !!) !!).loops == 1)
+}
+
+test "GIF: what writing refuses" {
+    image.Animation {}.encode_gif() ! assert(E.code == E.range)
+    let mixed = image.Animation { frames: .{ frame(noise(4, 4), 0), frame(noise(4, 5), 0) } }
+    mixed.encode_gif() ! assert(E.code == E.range)
+    let wide = image.Image.new(70000, 1, 1) !!
+    wide.encode_gif() ! assert(E.code == E.range)
+}

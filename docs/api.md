@@ -68,8 +68,11 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 + class Animation {
     // The frames, each a whole canvas.
     + frames: Array[Frame]
-    // How many times the animation plays; 0 plays it forever.
+    // How many times the animation plays; 0 plays it forever. A decoded GIF without a loop count plays once.
     + loops: uint
+
+    // Encodes the animation as a GIF, with the colours of each frame chosen as `encode_gif` does.
+    + fn encode_gif(dither: bool (true)) String !ImageError
 }
 ```
 
@@ -105,6 +108,8 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn encode_bmp() String
     // Writes the image as a bitmap to `out` and returns the bytes written; see `encode_bmp`.
     + fn encode_bmp_into(out: Writer) uint !io:IoError
+    // Encodes the image as a GIF, with more than 256 colours reduced to a palette of 256.
+    + fn encode_gif(dither: bool (true)) String !ImageError
     // Encodes the image as a baseline JPEG at `quality` (1..100).
     + fn encode_jpeg(quality: uint (85), subsample_chroma: bool (true)) String
     // Writes the image as JPEG to `out` and returns the bytes written; see `encode_jpeg`.
@@ -149,7 +154,7 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn to_rgb() Image
     // Returns a four-channel copy; the added alpha is opaque.
     + fn to_rgba() Image
-    // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg` or `.bmp`) and writes it there; JPEG uses the default quality of `encode_jpeg`.
+    // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.gif` or `.bmp`) and writes it there, with each encoder's defaults.
     + fn write(path: String) void !ImageError
 }
 ```

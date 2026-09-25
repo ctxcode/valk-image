@@ -12,7 +12,8 @@ use valk.mem
 + class Animation {
     /// The frames, each a whole canvas.
     + frames: Array[Frame] (.{})
-    /// How many times the animation plays; 0 plays it forever.
+    /// How many times the animation plays; 0 plays it forever. A decoded GIF without a loop
+    /// count plays once.
     + loops: uint (0)
 }
 
@@ -83,7 +84,8 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
     let global_palette: ?String = null
     if (packed & 0x80) != 0 : global_palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
 
-    let animation = Animation {}
+    // Without a loop block a GIF plays once
+    let animation = Animation { loops: 1 }
     let canvas_size = width * height * 4
     let canvas = [u8]{ 0 x canvas_size }
     let total_pixels: uint = 0
@@ -376,4 +378,303 @@ fn copy_bytes(source: local &[u8]) mut &[u8] {
     let out = [u8]{ 0 x source.length }
     mem.copy(source, out)
     return out
+}
+
+// ---------------------------------------------------------------------------------------
+// Encoder
+
+extend Image {
+    /// Encodes the image as a GIF, with more than 256 colours reduced to a palette of 256.
+    ///
+    /// An image with at most 256 colours keeps them exactly. One with more gets a palette
+    /// chosen for it, with Floyd–Steinberg dithering unless `dither` is false. Pixels with
+    /// alpha below 128 become transparent. Throws `range` when a side exceeds 65535 pixels,
+    /// the format's limit.
+    + fn encode_gif(dither: bool (true)) String !ImageError {
+        check_gif_size(this.width, this.height) !>
+        let region = Region { x: 0, y: 0, width: this.width, height: this.height }
+        let indexed = quantize(this, region, dither)
+        let out = ByteBuffer.new(this.width * this.height / 2 + 1024)
+        write_gif_screen(out, this.width, this.height, indexed)
+        if indexed.transparent >= 0 : write_gif_control(out, 0, 0, indexed.transparent)
+        write_gif_image(out, region, indexed, false)
+        out.write_byte(0x3B)
+        return out.into_string()
+    }
+}
+
+extend Animation {
+    /// Encodes the animation as a GIF, with the colours of each frame chosen as `encode_gif`
+    /// does.
+    ///
+    /// Every frame must be the size of the first. Delays are stored in hundredths of a second.
+    /// Only what changed since the previous frame is stored, or, when a frame has transparent
+    /// pixels, what is not transparent. Throws `range` for an animation without frames, frames
+    /// of different sizes, or a side over 65535 pixels.
+    + fn encode_gif(dither: bool (true)) String !ImageError {
+        let first = this.frames.get(0) ! throw .range { message: "An animation needs a frame" }
+        let width = first.image.width
+        let height = first.image.height
+        check_gif_size(width, height) !>
+        // With transparency anywhere, every frame is cleared after it shows, so the next one
+        // starts from a transparent canvas; else frames stay and the next draws what changed
+        let clear = false
+        each this.frames as frame, i {
+            let img = frame.image
+            if img.width != width || img.height != height : throw .range { message: "Frame " + i + " is " + img.width + "x" + img.height + ", the first is " + width + "x" + height }
+            if !clear && has_transparency(img) : clear = true
+        }
+        let out = ByteBuffer.new(width * height / 2 + 1024)
+        let previous: ?Image = null
+        each this.frames as frame, i {
+            let img = frame.image
+            let region = Region { x: 0, y: 0, width: width, height: height }
+            if clear : region = opaque_region(img)
+            else if isset(previous) : region = changed_region(previous, img)
+            let indexed = quantize(img, region, dither)
+            if i == 0 {
+                write_gif_screen(out, width, height, indexed)
+                if this.loops != 1 : write_gif_loops(out, this.loops == 0 ? 0 : this.loops - 1)
+            }
+            let delay = (frame.delay_ms + 5) / 10
+            write_gif_control(out, clear ? 2 : 1, delay > 65535 ? 65535 : delay, indexed.transparent)
+            write_gif_image(out, region, indexed, i > 0)
+            previous = img
+        }
+        out.write_byte(0x3B)
+        return out.into_string()
+    }
+}
+
+fn check_gif_size(width: uint, height: uint) !ImageError {
+    if width > 65535 || height > 65535 : throw .range { message: "GIF images are limited to 65535 pixels per side" }
+}
+
+fn has_transparency(img: Image) bool {
+    if img.channels != 4 : return false
+    let pixels = img.pixels
+    let i: uint = 3
+    while i < pixels.length {
+        if pixels[i] < ALPHA_CUTOFF : return true
+        i += 4
+    }
+    return false
+}
+
+// The smallest rectangle holding every visible pixel; one pixel when none is
+fn opaque_region(img: Image) Region {
+    let region = Region { x: img.width, y: img.height, width: 0, height: 0 }
+    let pixels = img.pixels
+    let c = img.channels.to(uint)
+    let y: uint = 0
+    while y < img.height {
+        let p = img.offset(0, y)
+        let x: uint = 0
+        while x < img.width {
+            if c != 4 || pixels[p + 3] >= ALPHA_CUTOFF : region.grow(x, y)
+            p += c
+            x++
+        }
+        y++
+    }
+    return region.or_pixel()
+}
+
+// The smallest rectangle holding every pixel that differs between two frames; one pixel when
+// none does
+fn changed_region(before: Image, after: Image) Region {
+    let region = Region { x: after.width, y: after.height, width: 0, height: 0 }
+    let c1 = before.channels.to(uint)
+    let c2 = after.channels.to(uint)
+    let a = before.pixels
+    let b = after.pixels
+    let y: uint = 0
+    while y < after.height {
+        let p1 = before.offset(0, y)
+        let p2 = after.offset(0, y)
+        let x: uint = 0
+        while x < after.width {
+            if !same_color(a, p1, c1, b, p2, c2) : region.grow(x, y)
+            p1 += c1
+            p2 += c2
+            x++
+        }
+        y++
+    }
+    return region.or_pixel()
+}
+
+fn same_color(a: local &[u8], p1: uint, c1: uint, b: local &[u8], p2: uint, c2: uint) bool {
+    if c1 == c2 {
+        let k: uint = 0
+        while k < c1 {
+            if a[p1 + k] != b[p2 + k] : return false
+            k++
+        }
+        return true
+    }
+    let k: uint = 0
+    while k < 3 {
+        if a[p1 + (c1 == 1 ? 0 : k)] != b[p2 + (c2 == 1 ? 0 : k)] : return false
+        k++
+    }
+    return true
+}
+
+extend Region {
+    // Stretches the region, which starts inverted, over pixel (`x`, `y`)
+    fn grow(x: uint, y: uint) {
+        let right = this.width > 0 ? this.x + this.width : 0
+        let bottom = this.height > 0 ? this.y + this.height : 0
+        if x < this.x : this.x = x
+        if y < this.y : this.y = y
+        if x + 1 > right : right = x + 1
+        if y + 1 > bottom : bottom = y + 1
+        this.width = right - this.x
+        this.height = bottom - this.y
+    }
+    // The region, or the top-left pixel when it holds nothing
+    fn or_pixel() Region {
+        if this.width == 0 : return Region { x: 0, y: 0, width: 1, height: 1 }
+        return this
+    }
+}
+
+// The bits of a colour table holding `colors` entries: 1 to 8
+fn gif_table_bits(indexed: Indexed) uint {
+    let entries = indexed.colors + (indexed.transparent >= 0 ? 1 : 0)
+    let bits: uint = 1
+    while (1 << bits) < entries : bits++
+    return bits
+}
+
+fn write_gif_table(out: ByteBuffer, indexed: Indexed, bits: uint) {
+    out.write(indexed.palette.view(0, indexed.colors * 3))
+    let padding = ((1 << bits) - indexed.colors) * 3
+    let i: uint = 0
+    while i < padding {
+        out.write_byte(0)
+        i++
+    }
+}
+
+// The header and screen descriptor, with the first image's colours as the global table
+fn write_gif_screen(out: ByteBuffer, width: uint, height: uint, indexed: Indexed) {
+    let bits = gif_table_bits(indexed)
+    out.write("GIF89a")
+    out.write_u16_le(width.to(u16))
+    out.write_u16_le(height.to(u16))
+    out.write_byte((0xF0 | (bits - 1)).to(u8))
+    out.write_byte(0) // background colour
+    out.write_byte(0) // pixel aspect ratio
+    write_gif_table(out, indexed, bits)
+}
+
+// The NETSCAPE block: how often the animation repeats after it first plays, 0 for forever
+fn write_gif_loops(out: ByteBuffer, repeats: uint) {
+    out.write("\x21\xFF\x0BNETSCAPE2.0\x03\x01")
+    out.write_u16_le((repeats > 65535 ? 65535 : repeats).to(u16))
+    out.write_byte(0)
+}
+
+// A graphic control extension for the next image
+fn write_gif_control(out: ByteBuffer, disposal: uint, delay: uint, transparent: int) {
+    out.write("\x21\xF9\x04")
+    out.write_byte(((disposal << 2) | (transparent >= 0 ? 1 : 0)).to(u8))
+    out.write_u16_le(delay.to(u16))
+    out.write_byte(transparent >= 0 ? transparent.to(u8) : 0)
+    out.write_byte(0)
+}
+
+// An image descriptor, its colour table when `local`, and its compressed pixels
+fn write_gif_image(out: ByteBuffer, region: Region, indexed: Indexed, local: bool) {
+    let bits = gif_table_bits(indexed)
+    out.write_byte(0x2C)
+    out.write_u16_le(region.x.to(u16))
+    out.write_u16_le(region.y.to(u16))
+    out.write_u16_le(region.width.to(u16))
+    out.write_u16_le(region.height.to(u16))
+    out.write_byte(local ? (0x80 | (bits - 1)).to(u8) : 0)
+    if local : write_gif_table(out, indexed, bits)
+    gif_lzw_encode(out, indexed.indexes, bits < 2 ? 2 : bits)
+}
+
+// Codes packed from the low bit up into sub-blocks of at most 255 bytes
+class GifCodes {
+    out: ByteBuffer
+    block: mut &[u8] ([u8]{ 0 x 255 })
+    used: uint (0)
+    bits: uint (0)
+    bit_count: uint (0)
+
+    fn emit(code: uint, size: uint) {
+        this.bits = this.bits | (code << this.bit_count)
+        this.bit_count += size
+        while this.bit_count >= 8 {
+            this.push(this.bits.to(u8))
+            this.bits = this.bits >> 8
+            this.bit_count -= 8
+        }
+    }
+    fn push(byte: u8) {
+        this.block[this.used++] = byte
+        if this.used < 255 : return
+        this.out.write_byte(255)
+        this.out.write(this.block)
+        this.used = 0
+    }
+    // Writes what is left and the empty block that ends the data
+    fn finish() {
+        if this.bit_count > 0 : this.push(this.bits.to(u8))
+        if this.used > 0 {
+            this.out.write_byte(this.used.to(u8))
+            this.out.write(this.block.view(0, this.used))
+        }
+        this.out.write_byte(0)
+    }
+}
+
+// Compresses palette indexes as GIF's LZW
+fn gif_lzw_encode(out: ByteBuffer, indexes: local &[u8], min_code_size: uint) {
+    out.write_byte(min_code_size.to(u8))
+    let clear = 1 << min_code_size
+    // Strings seen so far: (prefix code << 8 | byte) + 1 to their code, open-addressed
+    let keys = [u32]{ 0 x 8192 }
+    let codes = [u16]{ 0 x 8192 }
+    let next = clear + 2
+    let code_size = min_code_size + 1
+    let packer = GifCodes { out: out }
+    packer.emit(clear, code_size)
+    if indexes.length > 0 {
+        let prefix = indexes[0].to(uint)
+        let i: uint = 1
+        while i < indexes.length {
+            let byte = indexes[i++].to(uint)
+            let key = ((prefix << 8) | byte) + 1
+            let slot = ((key * 2654435761) >> 19) & 8191
+            while keys[slot] != 0 && keys[slot].to(uint) != key : slot = (slot + 1) & 8191
+            if keys[slot] != 0 {
+                prefix = codes[slot].to(uint)
+                continue
+            }
+            packer.emit(prefix, code_size)
+            if next < 4096 {
+                if next == (1 << code_size) : code_size++
+                keys[slot] = key.to(u32)
+                codes[slot] = next.to(u16)
+                next++
+            } else {
+                // The table is full: start over
+                packer.emit(clear, code_size)
+                let k: uint = 0
+                while k < 8192 : keys[k++] = 0
+                next = clear + 2
+                code_size = min_code_size + 1
+            }
+            prefix = byte
+        }
+        packer.emit(prefix, code_size)
+    }
+    packer.emit(clear + 1, code_size)
+    packer.finish()
 }
