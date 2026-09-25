@@ -31,10 +31,14 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 ## Functions for 'main'
 
 ```js
-// Decodes an image, recognizing the format from its first bytes: PNG, JPEG, WebP or BMP.
+// Decodes an image, recognizing the format from its first bytes: PNG, JPEG, WebP, GIF or BMP. A GIF gives its first frame.
 + fn decode(data: local &[u8]) Image !ImageError
 // Decodes a Windows bitmap.
 + fn decode_bmp(data: local &[u8]) Image !ImageError
+// Decodes a GIF: its first frame, over the whole canvas.
++ fn decode_gif(data: local &[u8]) Image !ImageError
+// Decodes every frame of a GIF, each composed onto the canvas as a browser shows it, with its delay and the loop count.
++ fn decode_gif_animation(data: local &[u8]) Animation !ImageError
 // Decodes a JPEG image.
 + fn decode_jpeg(data: local &[u8]) Image !ImageError
 // Decodes a PNG image.
@@ -43,6 +47,8 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 + fn decode_webp(data: local &[u8]) Image !ImageError
 // Whether `data` starts like a Windows bitmap.
 + fn is_bmp(data: local &[u8]) bool
+// Whether `data` starts with a GIF signature.
++ fn is_gif(data: local &[u8]) bool
 // Whether `data` starts with the JPEG marker sequence.
 + fn is_jpeg(data: local &[u8]) bool
 // Whether `data` starts with the PNG signature.
@@ -56,6 +62,26 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
 ```
 
 ## Classes for 'main'
+
+```js
+// An animated image: its frames in order and how often it plays.
++ class Animation {
+    // The frames, each a whole canvas.
+    + frames: Array[Frame]
+    // How many times the animation plays; 0 plays it forever.
+    + loops: uint
+}
+```
+
+```js
+// One picture of an animation: the whole canvas as it shows at that moment.
++ class Frame {
+    // How long the frame shows, in milliseconds.
+    + delay_ms: uint
+    // The full image at this point of the animation.
+    + image: Image
+}
+```
 
 ```js
 // An 8-bit image: `width` by `height` pixels of `channels` bytes each, row by row.

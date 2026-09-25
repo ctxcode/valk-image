@@ -1,0 +1,379 @@
+use valk.mem
+
+/// One picture of an animation: the whole canvas as it shows at that moment.
++ class Frame {
+    /// The full image at this point of the animation.
+    + image: Image
+    /// How long the frame shows, in milliseconds.
+    + delay_ms: uint (0)
+}
+
+/// An animated image: its frames in order and how often it plays.
++ class Animation {
+    /// The frames, each a whole canvas.
+    + frames: Array[Frame] (.{})
+    /// How many times the animation plays; 0 plays it forever.
+    + loops: uint (0)
+}
+
+/// Whether `data` starts with a GIF signature.
++ fn is_gif(data: local &[u8]) bool {
+    if data.length < 6 : return false
+    return data[0] == 'G' && data[1] == 'I' && data[2] == 'F' && data[3] == '8' && (data[4] == '7' || data[4] == '9') && data[5] == 'a'
+}
+
+/// Decodes a GIF: its first frame, over the whole canvas.
+///
+/// The result is RGBA when the frame has transparent pixels, RGB otherwise.
++ fn decode_gif(data: local &[u8]) Image !ImageError {
+    let animation = read_gif(data, true) !>
+    let first = animation.frames.get(0) ! throw .invalid { message: "The GIF holds no image" }
+    return first.image
+}
+
+/// Decodes every frame of a GIF, each composed onto the canvas as a browser shows it, with
+/// its delay and the loop count.
+///
+/// The frames are RGBA when any of them has transparent pixels, RGB otherwise. A file that ends
+/// after its first frame keeps the frames that were complete.
++ fn decode_gif_animation(data: local &[u8]) Animation !ImageError {
+    return read_gif(data, false) !>
+}
+
+// A position in the file
+class GifInput {
+    pos: uint (0)
+
+    fn byte(data: local &[u8]) u8 !ImageError {
+        if this.pos >= data.length : throw .invalid { message: "The GIF ends early" }
+        return data[this.pos++]
+    }
+    fn u16(data: local &[u8]) uint !ImageError {
+        let low = this.byte(data) !>
+        let high = this.byte(data) !>
+        return low.to(uint) | (high.to(uint) << 8)
+    }
+    fn bytes(data: local &[u8], count: uint) String !ImageError {
+        if this.pos + count > data.length : throw .invalid { message: "The GIF ends early" }
+        let out = data.view(this.pos, count).to_string()
+        this.pos += count
+        return out
+    }
+    // Skips data sub-blocks up to the empty one that ends them
+    fn skip_blocks(data: local &[u8]) !ImageError {
+        while true {
+            let size = this.byte(data) !>
+            if size == 0 : return
+            this.pos += size.to(uint)
+            if this.pos > data.length : throw .invalid { message: "The GIF ends early" }
+        }
+    }
+}
+
+fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
+    if !is_gif(data) : throw .invalid { message: "Not a GIF" }
+    let input = GifInput { pos: 6 }
+    let width = input.u16(data) !>
+    let height = input.u16(data) !>
+    let packed = input.byte(data) !>
+    input.byte(data) !> // background colour; browsers show transparency instead
+    input.byte(data) !> // pixel aspect ratio
+    if width == 0 || height == 0 : throw .invalid { message: "The GIF has no size" }
+    check_dimensions(width, height, 4) !>
+    let global_palette: ?String = null
+    if (packed & 0x80) != 0 : global_palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
+
+    let animation = Animation {}
+    let canvas_size = width * height * 4
+    let canvas = [u8]{ 0 x canvas_size }
+    let total_pixels: uint = 0
+    // The graphic control extension that applies to the next image
+    let delay: uint = 0
+    let transparent: int = -1
+    let disposal: uint = 0
+
+    while true {
+        let block = input.byte(data) ! {
+            if animation.frames.length > 0 : break
+            throw E
+        }
+        if block == 0x3B : break
+        if block == 0x21 {
+            let label = input.byte(data) !>
+            if label == 0xF9 {
+                let size = input.byte(data) !>
+                if size < 4 : throw .invalid { message: "A graphic control extension is too short" }
+                let flags = input.byte(data) !>
+                delay = input.u16(data) !>
+                let index = input.byte(data) !>
+                transparent = (flags & 1) != 0 ? index.to(int) : -1
+                disposal = ((flags >> 2) & 7).to(uint)
+                input.pos += size.to(uint) - 4
+                input.skip_blocks(data) !>
+                continue
+            }
+            if label == 0xFF {
+                let size = input.byte(data) !>
+                let id = input.bytes(data, size.to(uint)) !>
+                if id == "NETSCAPE2.0" || id == "ANIMEXTS1.0" {
+                    let sub = input.byte(data) !>
+                    if sub >= 3 {
+                        let kind = input.byte(data) !>
+                        let count = input.u16(data) !>
+                        // The count repeats after the first play; 0 repeats forever
+                        if kind == 1 : animation.loops = count == 0 ? 0 : count + 1
+                        input.pos += sub.to(uint) - 3
+                    } else {
+                        input.pos += sub.to(uint)
+                    }
+                }
+                input.skip_blocks(data) !>
+                continue
+            }
+            input.skip_blocks(data) !>
+            continue
+        }
+        if block != 0x2C {
+            if animation.frames.length > 0 : break
+            throw .invalid { message: "Unknown GIF block" }
+        }
+
+        let frame = read_gif_frame(data, input, width, height, global_palette, transparent) ! {
+            if animation.frames.length > 0 : break
+            throw E
+        }
+        total_pixels += canvas_size / 4
+        if total_pixels > MAX_PIXELS : throw .too_large { message: "The frames of the GIF hold more than MAX_PIXELS pixels" }
+        // "Restore to previous" puts back the canvas from before this frame
+        let before = disposal == 3 ? copy_bytes(canvas) : null
+        frame.draw(canvas, width)
+        let shown = Image.from_pixels(width, height, 4, copy_bytes(canvas)) !>
+        animation.frames.append(Frame { image: shown, delay_ms: delay * 10 })
+        if first_only : break
+        if disposal == 2 : frame.clear(canvas, width)
+        if disposal == 3 && isset(before) : canvas = before
+        delay = 0
+        transparent = -1
+        disposal = 0
+    }
+    if animation.frames.length == 0 : throw .invalid { message: "The GIF holds no image" }
+
+    // No transparent pixel anywhere: RGB is enough
+    let opaque = true
+    each animation.frames as frame {
+        let pixels = frame.image.pixels
+        let i: uint = 3
+        while i < pixels.length {
+            if pixels[i] != 255 {
+                opaque = false
+                break
+            }
+            i += 4
+        }
+        if !opaque : break
+    }
+    if opaque {
+        each animation.frames as frame : frame.image = frame.image.to_rgb()
+    }
+    return animation
+}
+
+// The pixels of one image of the file, as palette indexes
+class GifFrame {
+    left: uint
+    top: uint
+    width: uint
+    height: uint
+    indexes: mut &[u8]
+    palette: String
+    transparent: int
+
+    // Paints the frame onto the canvas, leaving its transparent pixels
+    fn draw(canvas: mut &[u8], canvas_width: uint) {
+        let canvas_height = canvas.length / 4 / canvas_width
+        let colors = this.palette.length / 3
+        let y: uint = 0
+        while y < this.height {
+            let cy = this.top + y
+            if cy >= canvas_height : break
+            let x: uint = 0
+            while x < this.width {
+                let cx = this.left + x
+                if cx >= canvas_width : break
+                let index = this.indexes[y * this.width + x].to(uint)
+                x++
+                if index.to(int) == this.transparent : continue
+                let at = (cy * canvas_width + cx) * 4
+                if index < colors {
+                    canvas[at] = this.palette[index * 3]
+                    canvas[at + 1] = this.palette[index * 3 + 1]
+                    canvas[at + 2] = this.palette[index * 3 + 2]
+                } else {
+                    // An index past the table shows black, as browsers do
+                    canvas[at] = 0
+                    canvas[at + 1] = 0
+                    canvas[at + 2] = 0
+                }
+                canvas[at + 3] = 255
+            }
+            y++
+        }
+    }
+
+    // "Restore to background": the frame's area becomes transparent
+    fn clear(canvas: mut &[u8], canvas_width: uint) {
+        let canvas_height = canvas.length / 4 / canvas_width
+        let y = this.top
+        while y < this.top + this.height && y < canvas_height {
+            let x = this.left
+            while x < this.left + this.width && x < canvas_width {
+                let at = (y * canvas_width + x) * 4
+                canvas[at] = 0
+                canvas[at + 1] = 0
+                canvas[at + 2] = 0
+                canvas[at + 3] = 0
+                x++
+            }
+            y++
+        }
+    }
+}
+
+fn read_gif_frame(data: local &[u8], input: GifInput, canvas_width: uint, canvas_height: uint, global_palette: ?String, transparent: int) GifFrame !ImageError {
+    let left = input.u16(data) !>
+    let top = input.u16(data) !>
+    let width = input.u16(data) !>
+    let height = input.u16(data) !>
+    let packed = input.byte(data) !>
+    if width * height > MAX_PIXELS : throw .too_large { message: "A frame of the GIF is too large" }
+    let palette = global_palette
+    if (packed & 0x80) != 0 : palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
+    let colors = palette ?! throw .invalid { message: "A GIF frame has no colour table" }
+    let min_code_size = input.byte(data) !>
+    let indexes = gif_lzw_decode(data, input, min_code_size.to(uint), width * height) !>
+    if (packed & 0x40) != 0 : indexes = gif_deinterlace(indexes, width, height)
+    return GifFrame { left: left, top: top, width: width, height: height, indexes: indexes, palette: colors, transparent: transparent }
+}
+
+// The LZW code stream of a frame, spread over sub-blocks, decoded to `count` palette indexes.
+// Codes are read LSB first; a table entry is written back to front through its prefixes.
+fn gif_lzw_decode(data: local &[u8], input: GifInput, min_code_size: uint, count: uint) mut &[u8] !ImageError {
+    if min_code_size < 1 || min_code_size > 11 : throw .invalid { message: "A GIF frame has an invalid LZW code size" }
+    let out = [u8]{ 0 x count }
+    let prefix = [u16]{ 0 x 4096 }
+    let suffix = [u8]{ 0 x 4096 }
+    let first = [u8]{ 0 x 4096 }
+    let lengths = [u16]{ 0 x 4096 }
+    let clear: uint = 1 << min_code_size
+    let end = clear + 1
+    let i: uint = 0
+    while i < clear {
+        suffix[i] = (i & 255).to(u8)
+        first[i] = (i & 255).to(u8)
+        lengths[i] = 1
+        i++
+    }
+    let code_size = min_code_size + 1
+    let next = end + 1
+    let previous: uint = 4096 // none
+    let bits: uint = 0
+    let bit_count: uint = 0
+    let block_left: uint = 0
+    let blocks_done = false
+    let written: uint = 0
+
+    while true {
+        while bit_count < code_size {
+            if block_left == 0 {
+                if blocks_done : break
+                block_left = (input.byte(data) !>).to(uint)
+                if block_left == 0 {
+                    blocks_done = true
+                    break
+                }
+            }
+            bits = bits | ((input.byte(data) !>).to(uint) << bit_count)
+            bit_count += 8
+            block_left--
+        }
+        if bit_count < code_size : break
+        let code = bits & ((1 << code_size) - 1)
+        bits = bits >> code_size
+        bit_count -= code_size
+
+        if code == clear {
+            code_size = min_code_size + 1
+            next = end + 1
+            previous = 4096
+            continue
+        }
+        if code == end : break
+        if code > next || (code == next && previous == 4096) {
+            throw .invalid { message: "A GIF frame has a corrupt LZW code" }
+        }
+
+        // The string of `code`, or for the code about to be made, the previous string plus
+        // its own first byte
+        let entry = code == next ? previous : code
+        let length = lengths[entry].to(uint)
+        let start = first[entry]
+        if code == next {
+            if written + length < count : out[written + length] = first[previous]
+            length++
+        }
+        let walk = entry
+        let at = written + lengths[entry].to(uint)
+        while at > written {
+            at--
+            if at < count : out[at] = suffix[walk]
+            walk = prefix[walk].to(uint)
+        }
+        written += length
+
+        if previous != 4096 && next < 4096 {
+            prefix[next] = previous.to(u16)
+            suffix[next] = code == next ? first[previous] : start
+            first[next] = first[previous]
+            lengths[next] = lengths[previous] + 1
+            next++
+            if next == (1 << code_size) && code_size < 12 : code_size++
+        }
+        previous = code
+        if written >= count : break
+    }
+    // Whatever is left of the sub-blocks after the end code
+    if !blocks_done {
+        if block_left > 0 {
+            input.pos += block_left
+            if input.pos > data.length : throw .invalid { message: "The GIF ends early" }
+        }
+        input.skip_blocks(data) !>
+    }
+    return out
+}
+
+// Rows of an interlaced frame come in four passes: every 8th from 0, every 8th from 4, every
+// 4th from 2, every 2nd from 1
+fn gif_deinterlace(indexes: mut &[u8], width: uint, height: uint) mut &[u8] {
+    let out = [u8]{ 0 x indexes.length }
+    let row: uint = 0
+    let pass: uint = 0
+    while pass < 4 {
+        let start: uint = pass == 0 ? 0 : (pass == 1 ? 4 : (pass == 2 ? 2 : 1))
+        let step: uint = pass == 0 ? 8 : (pass == 1 ? 8 : (pass == 2 ? 4 : 2))
+        let y = start
+        while y < height {
+            mem.copy(indexes.view(row * width, width), out.view(y * width, width))
+            row++
+            y += step
+        }
+        pass++
+    }
+    return out
+}
+
+fn copy_bytes(source: local &[u8]) mut &[u8] {
+    let out = [u8]{ 0 x source.length }
+    mem.copy(source, out)
+    return out
+}

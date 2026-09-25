@@ -1,0 +1,71 @@
+use image
+use valk.mem
+
+// References are ImageMagick's decoding of the same files (`-coalesce` for animations)
+
+// Fully transparent pixels match whatever colour they hold; ImageMagick keeps one, we clear it
+fn same_pixels(ours: image.Image, ref: image.Image) bool {
+    let other = ref
+    if ours.channels != other.channels : other = ours.channels == 4 ? other.to_rgba() : other.to_rgb()
+    if ours.width != other.width || ours.height != other.height : return false
+    if ours.channels != 4 : return mem.equals(ours.pixels, other.pixels)
+    let a = ours.pixels
+    let b = other.pixels
+    let i: uint = 0
+    while i < a.length {
+        if a[i + 3] != b[i + 3] : return false
+        if a[i + 3] > 0 && (a[i] != b[i] || a[i + 1] != b[i + 1] || a[i + 2] != b[i + 2]) : return false
+        i += 4
+    }
+    return true
+}
+
+fn gif_matches(name: String) bool {
+    let data = asset("gif-" + name + ".gif")
+    assert(image.is_gif(data))
+    let ours = image.decode(data) !!
+    let ref = image.decode_png(asset("gif-" + name + "-ref.png")) !!
+    return same_pixels(ours, ref)
+}
+
+test "GIF: still images decode exactly" {
+    // 256 colours, interlaced, and transparency
+    assert(gif_matches("photo"))
+    assert(gif_matches("inter"))
+    assert(gif_matches("trans"))
+    let photo = image.decode_gif(asset("gif-photo.gif")) !!
+    assert(photo.channels == 3)
+    let trans = image.decode_gif(asset("gif-trans.gif")) !!
+    assert(trans.channels == 4 && trans.get(0, 29, 3) == 0 && trans.get(20, 15, 3) == 255)
+}
+
+test "GIF: animations compose their frames like a browser" {
+    // Frames smaller than the canvas, at offsets, disposed of in each of the three ways
+    let anim = image.decode_gif_animation(asset("gif-anim.gif")) !!
+    assert(anim.frames.length == 4 && anim.loops == 3)
+    each anim.frames as frame, i {
+        assert(frame.delay_ms == 200)
+        let ref = image.decode_png(asset("gif-anim-" + i + ".png")) !!
+        assert(same_pixels(frame.image, ref))
+    }
+    // A colour table per frame
+    let local = image.decode_gif_animation(asset("gif-local.gif")) !!
+    assert(local.frames.length == 2 && local.loops == 0)
+    each local.frames as frame, i {
+        assert(frame.delay_ms == 50)
+        let ref = image.decode_png(asset("gif-local-" + i + ".png")) !!
+        assert(same_pixels(frame.image, ref))
+    }
+}
+
+test "GIF: truncated and malformed files" {
+    let data = asset("gif-anim.gif")
+    // Cut inside the last frame: the complete frames stay
+    let cut = image.decode_gif_animation(data.range(0, data.bytes - 12)) !!
+    assert(cut.frames.length == 3)
+    let photo = asset("gif-photo.gif")
+    image.decode_gif(photo.range(0, 20)) ! assert(E.code == E.invalid)
+    image.decode_gif("GIF89a") ! assert(E.code == E.invalid)
+    image.decode_gif("not a gif") ! assert(E.code == E.invalid)
+    assert(!image.is_gif("GIF90a"))
+}

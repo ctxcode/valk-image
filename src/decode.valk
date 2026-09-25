@@ -1,13 +1,14 @@
 use valk.fs
 
-/// Decodes an image, recognizing the format from its first bytes: PNG, JPEG, WebP or
-/// BMP.
+/// Decodes an image, recognizing the format from its first bytes: PNG, JPEG, WebP, GIF
+/// or BMP. A GIF gives its first frame.
 ///
 /// Anything else throws `invalid`.
 + fn decode(data: local &[u8]) Image !ImageError {
     if is_png(data) : return decode_png(data) !>
     if is_jpeg(data) : return decode_jpeg(data) !>
     if is_webp(data) : return decode_webp(data) !>
+    if is_gif(data) : return decode_gif(data) !>
     if is_bmp(data) : return decode_bmp(data) !>
     throw .invalid { message: "Unknown image format" }
 }
