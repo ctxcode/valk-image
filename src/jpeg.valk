@@ -163,6 +163,7 @@ class Huffman {
             let n = counts[l - 1].to(uint)
             table.mincode[l] = code
             table.valptr[l] = k
+            if code + n.to(int) > (1 << l) : throw .invalid { message: "Huffman table is over-subscribed" }
             let i: uint = 0
             while i < n {
                 if l <= FAST_BITS {
@@ -179,7 +180,6 @@ class Huffman {
                 i++
             }
             table.maxcode[l] = n > 0 ? code - 1 : -1
-            if code > (1 << l) : throw .invalid { message: "Huffman table is over-subscribed" }
             code = code << 1
             l++
         }
@@ -205,7 +205,7 @@ class Component {
     plane: mut &[u8] ([u8]{ 0 x 0 })
     // Progressive frames gather the coefficients of every block (natural order, 64 per
     // block) over several scans and transform them at the end
-    coefs: mut &[int] ([int]{ 0 x 0 })
+    coefs: mut &[i16] ([i16]{ 0 x 0 })
 
     get stride: uint {
         return this.blocks_w * 8
@@ -244,6 +244,9 @@ class Decoder {
     ah: uint (0)
     al: uint (0)
     eobrun: uint (0)
+    // Zero bits made up past the end of the entropy-coded data, and whether a scan used them
+    padding_bits: uint (0)
+    overrun: bool (false)
     coef: mut &[int] ([int]{ 0 x 64 })
     tmp: mut &[int] ([int]{ 0 x 64 })
 
@@ -276,8 +279,12 @@ class Decoder {
                 this.restart_interval = (segment[0].to(uint) << 8) | segment[1].to(uint)
             } else if marker == 0xda {
                 if !this.seen_frame : throw .invalid { message: "Scan before the frame header" }
-                this.parse_scan(segment) !>
-                this.decode_scan() !>
+                // Once a scan has run short of data, later scans would only decode more
+                // made-up zeros over the whole picture: skip them
+                if !this.overrun {
+                    this.parse_scan(segment) !>
+                    this.decode_scan() !>
+                }
                 seen_scan = true
             } else if marker == 0xe1 {
                 let orientation = exif_orientation(segment)
@@ -295,13 +302,15 @@ class Decoder {
     // Advances to the next marker and returns its code
     fn next_marker() u8 !ImageError {
         let data = this.data
-        while this.pos < data.length && data[this.pos] != 0xff : this.pos++
-        while this.pos < data.length && data[this.pos] == 0xff : this.pos++
-        if this.pos >= data.length : throw .invalid { message: "Missing end of image" }
-        let marker = data[this.pos]
-        this.pos++
-        if marker == 0 : return this.next_marker() !>
-        return marker
+        while true {
+            while this.pos < data.length && data[this.pos] != 0xff : this.pos++
+            while this.pos < data.length && data[this.pos] == 0xff : this.pos++
+            if this.pos >= data.length : throw .invalid { message: "Missing end of image" }
+            let marker = data[this.pos]
+            this.pos++
+            // FF 00 is a stuffed byte inside entropy-coded data, not a marker
+            if marker != 0 : return marker
+        }
     }
 
     fn parse_frame(segment: local &[u8]) !ImageError {
@@ -343,7 +352,7 @@ class Decoder {
             comp.blocks_w = this.mcus_x * comp.h
             comp.blocks_h = this.mcus_y * comp.v
             comp.plane = [u8]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
-            if this.progressive : comp.coefs = [int]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
+            if this.progressive : comp.coefs = [i16]{ 0 x comp.blocks_w * comp.blocks_h * 64 }
         }
         this.seen_frame = true
     }
@@ -434,6 +443,7 @@ class Decoder {
     fn decode_scan() !ImageError {
         this.acc = 0
         this.acc_bits = 0
+        this.padding_bits = 0
         let mcu_count: uint = 0
         if this.scan.length == 1 {
             // A single-component scan walks the component's own blocks, not padded MCUs
@@ -476,12 +486,20 @@ class Decoder {
             }
         }
         // Leave the position at the marker that ended the entropy-coded segment
+        this.check_overrun()
         this.acc = 0
         this.acc_bits = 0
     }
 
+    // Whether the bits consumed since the last reset ran into the made-up zeros
+    fn check_overrun() {
+        if this.padding_bits > this.acc_bits : this.overrun = true
+        this.padding_bits = 0
+    }
+
     // Expects an RSTn marker: drops the buffered bits and resets the DC predictors
     fn restart() !ImageError {
+        this.check_overrun()
         this.acc = 0
         this.acc_bits = 0
         let data = this.data
@@ -508,10 +526,15 @@ class Decoder {
                 byte = data[this.pos].to(uint)
                 if byte == 0xff {
                     if this.pos + 1 < data.length && data[this.pos + 1] == 0 : this.pos += 2
-                    else : byte = 0
+                    else {
+                        byte = 0
+                        this.padding_bits += 8
+                    }
                 } else {
                     this.pos++
                 }
+            } else {
+                this.padding_bits += 8
             }
             this.acc = (this.acc << 8) | byte
             this.acc_bits += 8
@@ -567,9 +590,9 @@ class Decoder {
                 let category = this.decode_symbol(dc_table) !>
                 if category > 11 : throw .invalid { message: "Bad DC coefficient" }
                 comp.pred += this.receive_extend(category.to(uint))
-                coefs[base] = comp.pred << this.al
+                coefs[base] = (comp.pred << this.al).to(i16)
             } else if this.read_bits(1) == 1 {
-                coefs[base] = coefs[base] | (1 << this.al)
+                coefs[base] = (coefs[base].to(int) | (1 << this.al)).to(i16)
             }
             return
         }
@@ -597,7 +620,7 @@ class Decoder {
                 }
                 k += run
                 if k > 63 : throw .invalid { message: "Coefficients overflow the block" }
-                coefs[base + zigzag_order[k].to(uint)] = this.receive_extend(size) << this.al
+                coefs[base + zigzag_order[k].to(uint)] = (this.receive_extend(size) << this.al).to(i16)
                 k++
             }
             return
@@ -637,7 +660,7 @@ class Decoder {
                 if coefs[at] != 0 {
                     this.refine(coefs, at, bit)
                 } else if skip == 0 {
-                    coefs[at] = value
+                    coefs[at] = value.to(i16)
                     break
                 } else {
                     skip--
@@ -647,11 +670,11 @@ class Decoder {
     }
 
     // Adds one bit of precision to a coefficient that is already non-zero
-    fn refine(coefs: local mut &[int], at: uint, bit: int) {
+    fn refine(coefs: local mut &[i16], at: uint, bit: int) {
         if this.read_bits(1) == 0 : return
-        let value = coefs[at]
+        let value = coefs[at].to(int)
         if (value & bit) != 0 : return
-        coefs[at] = value > 0 ? value + bit : value - bit
+        coefs[at] = (value > 0 ? value + bit : value - bit).to(i16)
     }
 
     // Dequantizes and transforms every block once all scans are in
@@ -674,7 +697,7 @@ class Decoder {
                     let base = (by * comp.blocks_w + bx) * 64
                     let i: uint = 0
                     while i < 64 {
-                        coef[i] = coefs[base + i] * natural_quant[i]
+                        coef[i] = coefs[base + i].to(int) * natural_quant[i]
                         i++
                     }
                     idct_block(coef, this.tmp, comp.plane, (by * 8) * comp.stride + bx * 8, comp.stride)

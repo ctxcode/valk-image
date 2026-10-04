@@ -1,0 +1,53 @@
+use image
+
+// Inputs found by fuzzing the decoders: each must end in an error or a picture, never a crash
+// or a run over the whole of a huge declared size
+
+fn splice(data: String, at: uint, bytes: String) String {
+    let buf = ByteBuffer.new(data.bytes)
+    buf.write(data)
+    each bytes as b, i : buf.set(at + i, b)
+    return buf.to_string()
+}
+
+test "Malformed: an over-subscribed JPEG Huffman table" {
+    // The first DC table claims three 1-bit codes
+    let data = asset("photo-420.jpg")
+    let at = data.index_of("\xff\xc4") !!
+    let bad = splice(data, at + 5, "\x03\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    let failed = false
+    image.decode_jpeg(bad) ! {
+        assert(E.code == E.invalid && E.message.contains("over-subscribed"))
+        failed = true
+    }
+    assert(failed)
+}
+
+test "Malformed: stuffed zero bytes after a JPEG scan" {
+    // Each FF 00 pair used to cost a stack frame while looking for the next marker
+    let data = asset("photo-420.jpg")
+    let buf = ByteBuffer.new(data.bytes + 400000)
+    buf.write(data.range(0, data.bytes - 2))
+    let i: uint = 0
+    while i < 200000 {
+        buf.write("\xff\x00")
+        i++
+    }
+    buf.write("\xff\xd9")
+    let img = image.decode_jpeg(buf) !!
+    assert(img.width == 37 && img.height == 29)
+}
+
+test "Malformed: JPEG scans after one that ran out of data are skipped" {
+    // A scan cut short, then a scan header naming a component the frame does not have:
+    // decoding it would cover the picture again with made-up zeros
+    let data = asset("photo-420.jpg")
+    let sos = data.index_of("\xff\xda") !!
+    let header_end = sos + 2 + ((data[sos + 2].to(uint) << 8) | data[sos + 3].to(uint))
+    let buf = ByteBuffer.new(data.bytes)
+    buf.write(data.range(0, header_end + 20))
+    buf.write("\xff\xda\x00\x08\x01\x09\x00\x00\x3f\x00")
+    buf.write("\xff\xd9")
+    let img = image.decode_jpeg(buf) !!
+    assert(img.width == 37 && img.height == 29)
+}
