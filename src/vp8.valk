@@ -222,10 +222,11 @@ class Vp8Decoder {
                 this.mb_filter[at + 3] = (!this.use_pred_y16 || !skip) ? 1 : 0
                 mbx++
             }
+            // Checked per row so a short file fails before decoding the rest of its size
+            if fp.eof : throw .invalid { message: "VP8 data ends early" }
+            each this.partitions as partition : if partition.eof : throw .invalid { message: "VP8 data ends early" }
             mby++
         }
-        if fp.eof : throw .invalid { message: "VP8 data ends early" }
-        each this.partitions as partition : if partition.eof : throw .invalid { message: "VP8 data ends early" }
         if this.filter_level != 0 {
             if this.filter_simple : this.simple_filter()
             else : this.normal_filter()

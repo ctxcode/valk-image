@@ -123,3 +123,16 @@ test "Malformed: a GIF frame declaring far more pixels than its data can hold" {
     }
     assert(failed)
 }
+
+test "Malformed: a lossy WebP declaring far more macroblocks than its data holds" {
+    // 8000x8000 with the data of a small picture: fails at the first row past the data
+    let data = asset("webp-lossy-rgb.webp")
+    let at = data.index_of("VP8 ") !!
+    let bad = splice(data, at + 14, "\x40\x1f\x40\x1f")
+    let failed = false
+    image.decode_webp(bad) ! {
+        assert(E.code == E.invalid && E.message.contains("ends early"))
+        failed = true
+    }
+    assert(failed)
+}
