@@ -144,7 +144,6 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
 
     let bits_per_pixel = samples * bit_depth.to(uint)
     let bytes_per_pixel = bits_per_pixel < 8 ? 1 : bits_per_pixel / 8
-    let image = Image.new(width, height, out_channels) !>
 
     // Interlaced files hold seven passes of filtered rows, each a smaller picture of every
     // n-th pixel; plain files are one pass covering everything
@@ -159,6 +158,8 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
     }
     let raw = compress.unzlib(idat, raw_size) ! throw .invalid { message: "Corrupt image data" }
     if raw.bytes != raw_size : throw .invalid { message: "Image data has the wrong size" }
+    // Allocated only now that the data has been found to fill it
+    let image = Image.new(width, height, out_channels) !>
     let rows = [u8]{ 0 x raw_size }
     mem.copy(raw, rows)
 

@@ -1,4 +1,5 @@
 use image
+use valk.compress
 
 // Inputs found by fuzzing the decoders: each must end in an error or a picture, never a crash
 // or a run over the whole of a huge declared size
@@ -67,6 +68,23 @@ test "Malformed: GIF frames larger than the canvas count towards MAX_PIXELS" {
     let failed = false
     image.decode_gif_animation(buf) ! {
         assert(E.code == E.too_large)
+        failed = true
+    }
+    assert(failed)
+}
+
+test "Malformed: a huge PNG with almost no data" {
+    // 8192x8192 RGBA at 16 bits with a few bytes of image data
+    let png = image.Image.new(1, 1, 4) !!
+    let data = png.encode_png()
+    let at = data.index_of("IHDR") !!
+    let bad = splice(data, at + 4, "\x00\x00\x20\x00\x00\x00\x20\x00\x10")
+    let crc = ByteBuffer.new(4)
+    crc.write_u32_be(compress.crc32(bad.range(at, 17)))
+    bad = splice(bad, at + 17, crc.to_string())
+    let failed = false
+    image.decode_png(bad) ! {
+        assert(E.code == E.invalid && E.message.contains("wrong size"))
         failed = true
     }
     assert(failed)
