@@ -192,7 +192,8 @@ class LlDecoder {
     pos: uint (0)
     acc: uint (0)
     acc_bits: uint (0)
-    overrun: bool (false)
+    // Zero bits added past the end of the data; once fewer bits are left, they are in use
+    padding: uint (0)
 
     // Least significant bit first
     fn fill() {
@@ -201,8 +202,8 @@ class LlDecoder {
             if this.pos < this.data.length {
                 byte = this.data[this.pos].to(uint)
                 this.pos++
-            } else if this.acc_bits == 0 {
-                this.overrun = true
+            } else {
+                this.padding += 8
             }
             this.acc = this.acc | (byte << this.acc_bits)
             this.acc_bits += 8
@@ -355,6 +356,7 @@ class LlDecoder {
         let group = groups[0]
         let pos: uint = 0
         while pos < total {
+            if this.acc_bits < this.padding : throw .invalid { message: "Lossless data ends early" }
             if isset(meta) {
                 let x = pos % width
                 let y = pos / width
@@ -392,7 +394,7 @@ class LlDecoder {
                 pos++
             }
         }
-        if this.overrun : throw .invalid { message: "Lossless data ends early" }
+        if this.acc_bits < this.padding : throw .invalid { message: "Lossless data ends early" }
         return pixels
     }
 

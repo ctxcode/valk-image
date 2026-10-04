@@ -136,3 +136,27 @@ test "Malformed: a lossy WebP declaring far more macroblocks than its data holds
     }
     assert(failed)
 }
+
+test "Malformed: a lossless WebP cut short with its sizes fixed up" {
+    // Noise does not compress, so the first half of the data holds about half the pixels
+    let img = image.Image.new(64, 64, 3) !!
+    let seed: uint = 7
+    each img.pixels as _, i {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        img.pixels[i] = (seed >> 16).to(u8)
+    }
+    let data = img.encode_webp_lossless() !!
+    let cut = data.bytes / 2
+    let size = ByteBuffer.new(4)
+    size.write_u32_le((cut - 8).to(u32))
+    let bad = splice(data.range(0, cut), 4, size.to_string())
+    size.clear()
+    size.write_u32_le((cut - 20).to(u32))
+    bad = splice(bad, 16, size.to_string())
+    let failed = false
+    image.decode_webp(bad) ! {
+        assert(E.code == E.invalid && E.message.contains("ends early"))
+        failed = true
+    }
+    assert(failed)
+}
