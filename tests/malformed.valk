@@ -54,14 +54,23 @@ test "Malformed: JPEG scans after one that ran out of data are skipped" {
 }
 
 test "Malformed: GIF frames larger than the canvas count towards MAX_PIXELS" {
-    // A 1x1 canvas and frames that each declare 65535x1000 pixels
-    let buf = ByteBuffer.new(256)
+    // A 1x1 canvas and frames that each declare 65535x400 pixels, followed by a comment
+    // long enough that the frames could hold that many
+    let buf = ByteBuffer.new(4096)
     buf.write("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff")
     let i: uint = 0
     while i < 3 {
-        buf.write("\x2c\x00\x00\x00\x00\xff\xff\xe8\x03\x00\x02\x02\x44\x01\x00")
+        buf.write("\x2c\x00\x00\x00\x00\xff\xff\x90\x01\x00\x02\x02\x44\x01\x00")
         i++
     }
+    buf.write("\x21\xfe")
+    i = 0
+    while i < 10 {
+        buf.write_byte(255)
+        buf.write("x".repeat(255))
+        i++
+    }
+    buf.write_byte(0)
     buf.write("\x3b")
     let first = image.decode_gif(buf) !!
     assert(first.width == 1 && first.height == 1)
@@ -85,6 +94,31 @@ test "Malformed: a huge PNG with almost no data" {
     let failed = false
     image.decode_png(bad) ! {
         assert(E.code == E.invalid && E.message.contains("wrong size"))
+        failed = true
+    }
+    assert(failed)
+}
+
+test "Malformed: a JPEG declaring far more MCUs than its data can hold" {
+    // 8000x8000 with about 1 KB of data
+    let data = asset("photo-420.jpg")
+    let at = data.index_of("\xff\xc0") !!
+    let bad = splice(data, at + 5, "\x1f\x40\x1f\x40")
+    let failed = false
+    image.decode_jpeg(bad) ! {
+        assert(E.code == E.invalid && E.message.contains("too short"))
+        failed = true
+    }
+    assert(failed)
+}
+
+test "Malformed: a GIF frame declaring far more pixels than its data can hold" {
+    let buf = ByteBuffer.new(64)
+    buf.write("GIF89a\xff\xff\x00\x04\x80\x00\x00\x00\x00\x00\xff\xff\xff")
+    buf.write("\x2c\x00\x00\x00\x00\xff\xff\x00\x04\x00\x02\x02\x44\x01\x00\x3b")
+    let failed = false
+    image.decode_gif(buf) ! {
+        assert(E.code == E.invalid && E.message.contains("too short"))
         failed = true
     }
     assert(failed)

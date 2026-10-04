@@ -87,7 +87,8 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
     // Without a loop block a GIF plays once
     let animation = Animation { loops: 1 }
     let canvas_size = width * height * 4
-    let canvas = [u8]{ 0 x canvas_size }
+    // Allocated once a frame was read, so a broken file costs no canvas
+    let canvas = [u8]{ 0 x 0 }
     let total_pixels: uint = 0
     // The graphic control extension that applies to the next image
     let delay: uint = 0
@@ -144,6 +145,7 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
             if animation.frames.length > 0 : break
             throw E
         }
+        if canvas.length == 0 : canvas = [u8]{ 0 x canvas_size }
         // A frame larger than the canvas still costs its own size to decode
         let frame_pixels = frame.width * frame.height
         total_pixels += frame_pixels > canvas_size / 4 ? frame_pixels : canvas_size / 4
@@ -254,6 +256,8 @@ fn read_gif_frame(data: local &[u8], input: GifInput, canvas_width: uint, canvas
     if (packed & 0x80) != 0 : palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
     let colors = palette ?! throw .invalid { message: "A GIF frame has no colour table" }
     let min_code_size = input.byte(data) !>
+    // A code takes at least 2 bits and stands for at most 4096 pixels
+    if width * height > (data.length - input.pos) * 16384 : throw .invalid { message: "The GIF data is too short for its size" }
     let indexes = gif_lzw_decode(data, input, min_code_size.to(uint), width * height) !>
     if (packed & 0x40) != 0 : indexes = gif_deinterlace(indexes, width, height)
     return GifFrame { left: left, top: top, width: width, height: height, indexes: indexes, palette: colors, transparent: transparent }
