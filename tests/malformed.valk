@@ -160,3 +160,72 @@ test "Malformed: a lossless WebP cut short with its sizes fixed up" {
     }
     assert(failed)
 }
+
+// Writes bits least significant first, as VP8L reads them
+class BitWriter {
+    out: ByteBuffer (ByteBuffer.new(1024))
+    acc: uint (0)
+    count: uint (0)
+
+    fn write(value: uint, bits: uint) {
+        let i: uint = 0
+        while i < bits {
+            this.acc = this.acc | (((value >> i) & 1) << this.count)
+            this.count++
+            if this.count == 8 {
+                this.out.write_byte(this.acc.to(u8))
+                this.acc = 0
+                this.count = 0
+            }
+            i++
+        }
+    }
+    // A Huffman code of one 8-bit symbol, which then takes no bits per pixel
+    fn single(symbol: uint) {
+        this.write(1, 1)
+        this.write(0, 1)
+        this.write(1, 1)
+        this.write(symbol, 8)
+    }
+}
+
+test "Malformed: a lossless WebP naming entropy group 65535" {
+    // 4x4 pixels whose meta image picks group 65535: all 65536 groups are in the data, only
+    // the last is used and must be the one applied
+    let w = BitWriter{}
+    w.write(0x2f, 8)
+    w.write(3, 14)
+    w.write(3, 14)
+    w.write(0, 4)
+    w.write(0, 1) // no transforms
+    w.write(0, 1) // no colour cache
+    w.write(1, 1) // meta image, 4x4 blocks
+    w.write(0, 3)
+    w.write(0, 1)
+    w.single(0xff) // green and red of the meta pixel: group 0xffff
+    w.single(0xff)
+    w.single(0)
+    w.single(0)
+    w.single(0)
+    let g: uint = 0
+    while g < 65536 {
+        // green, red, blue, alpha, distance
+        w.single(g == 65535 ? 0x80 : 0x10)
+        w.single(g == 65535 ? 0x40 : 0x10)
+        w.single(0x20)
+        w.single(0xff)
+        w.single(0)
+        g++
+    }
+    w.write(0, 8)
+    let chunk = w.out.to_string()
+    let file = ByteBuffer.new(chunk.bytes + 32)
+    file.write("RIFF")
+    file.write_u32_le((chunk.bytes + 12).to(u32))
+    file.write("WEBPVP8L")
+    file.write_u32_le(chunk.bytes.to(u32))
+    file.write(chunk)
+    let img = image.decode_webp(file) !!
+    assert(img.width == 4 && img.height == 4 && img.channels == 3)
+    assert(img.get(3, 3, 0) == 0x40 && img.get(3, 3, 1) == 0x80 && img.get(3, 3, 2) == 0x20)
+}

@@ -340,12 +340,21 @@ class LlDecoder {
                 if group > largest : largest = group
                 i++
             }
-            meta = image
+            // Every group up to the largest is in the data, but only the used ones are kept:
+            // a few bits per group must not cost a full set of tables each
+            let slots = [uint]{ 0 x largest + 1 }
+            each image as group : slots[group] = 1
             let g: uint = 0
             while g <= largest {
-                groups.append(this.read_group(cache_bits) !>)
+                let group = this.read_group(cache_bits) !>
+                if slots[g] != 0 {
+                    slots[g] = groups.length
+                    groups.append(group)
+                }
                 g++
             }
+            each image as group, at : image[at] = slots[group]
+            meta = image
         } else {
             groups.append(this.read_group(cache_bits) !>)
         }
