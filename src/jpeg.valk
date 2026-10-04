@@ -346,6 +346,8 @@ class Decoder {
         }
         this.mcus_x = (this.width + this.hmax * 8 - 1) / (this.hmax * 8)
         this.mcus_y = (this.height + this.vmax * 8 - 1) / (this.vmax * 8)
+        // Every scan spends at least one bit per MCU
+        if (this.data.length - this.pos) * 8 < this.mcus_x * this.mcus_y : throw .invalid { message: "The JPEG data is too short for its size" }
         each this.components as comp {
             comp.width = (this.width * comp.h + this.hmax - 1) / this.hmax
             comp.height = (this.height * comp.v + this.vmax - 1) / this.vmax
