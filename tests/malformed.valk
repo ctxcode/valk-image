@@ -67,7 +67,11 @@ test "Malformed: GIF frames larger than the canvas count towards MAX_PIXELS" {
     i = 0
     while i < 10 {
         buf.write_byte(255)
-        buf.write("x".repeat(255))
+        let k: uint = 0
+        while k < 255 {
+            buf.write_byte('x')
+            k++
+        }
         i++
     }
     buf.write_byte(0)
