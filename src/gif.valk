@@ -144,7 +144,9 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
             if animation.frames.length > 0 : break
             throw E
         }
-        total_pixels += canvas_size / 4
+        // A frame larger than the canvas still costs its own size to decode
+        let frame_pixels = frame.width * frame.height
+        total_pixels += frame_pixels > canvas_size / 4 ? frame_pixels : canvas_size / 4
         if total_pixels > MAX_PIXELS : throw .too_large { message: "The frames of the GIF hold more than MAX_PIXELS pixels" }
         // "Restore to previous" puts back the canvas from before this frame
         let before = disposal == 3 ? copy_bytes(canvas) : null

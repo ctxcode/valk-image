@@ -51,3 +51,23 @@ test "Malformed: JPEG scans after one that ran out of data are skipped" {
     let img = image.decode_jpeg(buf) !!
     assert(img.width == 37 && img.height == 29)
 }
+
+test "Malformed: GIF frames larger than the canvas count towards MAX_PIXELS" {
+    // A 1x1 canvas and frames that each declare 65535x1000 pixels
+    let buf = ByteBuffer.new(256)
+    buf.write("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff")
+    let i: uint = 0
+    while i < 3 {
+        buf.write("\x2c\x00\x00\x00\x00\xff\xff\xe8\x03\x00\x02\x02\x44\x01\x00")
+        i++
+    }
+    buf.write("\x3b")
+    let first = image.decode_gif(buf) !!
+    assert(first.width == 1 && first.height == 1)
+    let failed = false
+    image.decode_gif_animation(buf) ! {
+        assert(E.code == E.too_large)
+        failed = true
+    }
+    assert(failed)
+}
