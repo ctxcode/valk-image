@@ -503,7 +503,7 @@ fn average2(a: uint, b: uint) uint {
     return (((a ^ b) & 0xfefefefe) >> 1) + (a & b)
 }
 
-fn expand_palette(packed: mut &[uint], transform: LlTransform, packed_width: uint, width: uint, height: uint) mut &[uint] {
+fn expand_palette(packed: local mut &[uint], transform: LlTransform, packed_width: uint, width: uint, height: uint) mut &[uint] {
     let palette = transform.data
     let bits = transform.width_bits
     let per_pixel: uint = 8 >> bits

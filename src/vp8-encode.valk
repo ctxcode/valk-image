@@ -1008,7 +1008,7 @@ fn put_chroma_tokens(sink: Vp8Sink, levels: local &[i16], at: uint, left: uint, 
 }
 
 // libwebp's second-order transform of the 16 luma DCs (raster block order) into `out`
-fn forward_wht(dc: local &[int], out: mut &[int]) {
+fn forward_wht(dc: local &[int], out: local mut &[int]) {
     let tmp = [int]{ 0 x 16 }
     let i: uint = 0
     while i < 4 {
@@ -1038,7 +1038,7 @@ fn forward_wht(dc: local &[int], out: mut &[int]) {
 
 // Levels in zigzag order from raster coefficients, rounded by `bias`/256 of a step; those
 // before `start` are 0
-fn quantize_block(coeffs: local &[int], levels: mut &[i16], at: uint, start: uint, dc_step: int, ac_step: int, dc_bias: int, ac_bias: int) {
+fn quantize_block(coeffs: local &[int], levels: local mut &[i16], at: uint, start: uint, dc_step: int, ac_step: int, dc_bias: int, ac_bias: int) {
     let n: uint = 0
     while n < 16 {
         if n < start {
@@ -1058,7 +1058,7 @@ fn quantize_block(coeffs: local &[int], levels: mut &[i16], at: uint, start: uin
 }
 
 // Levels back to coefficients as the decoder scales them, in raster order
-fn dequantize_block(levels: local &[i16], at: uint, coeff: mut &[int], to: uint, dc_step: int, ac_step: int) {
+fn dequantize_block(levels: local &[i16], at: uint, coeff: local mut &[int], to: uint, dc_step: int, ac_step: int) {
     let n: uint = 0
     while n < 16 {
         coeff[to + zigzag4[n].to(uint)] = levels[at + n].to(int) * (n == 0 ? dc_step : ac_step)
@@ -1075,7 +1075,7 @@ fn has_levels(levels: local &[i16], at: uint, start: uint) bool {
     return false
 }
 
-fn copy_levels(from: local &[i16], from_at: uint, to: mut &[i16], to_at: uint, count: uint) {
+fn copy_levels(from: local &[i16], from_at: uint, to: local mut &[i16], to_at: uint, count: uint) {
     let i: uint = 0
     while i < count {
         to[to_at + i] = from[from_at + i]

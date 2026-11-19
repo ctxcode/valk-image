@@ -221,7 +221,7 @@ fn measure_box(box: ColorBox, bins: local &[u16], counts: local &[uint], sums: l
 
 // Sorts the box's bins along its widest channel and returns where half its pixels lie.
 // `starts` is scratch space of 33 entries.
-fn split_box(box: ColorBox, bins: mut &[u16], sorted: mut &[u16], counts: local &[uint], starts: mut &[uint]) uint {
+fn split_box(box: ColorBox, bins: local mut &[u16], sorted: local mut &[u16], counts: local &[uint], starts: local mut &[uint]) uint {
     let shift: uint = box.axis == 0 ? 10 : (box.axis == 1 ? 5 : 0)
     // A counting sort on the channel's 5 bits
     let v: uint = 0

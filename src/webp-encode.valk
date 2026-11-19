@@ -56,7 +56,7 @@ extend Image {
 
 // The transforms and pixels of a lossless image, without the header: coded with a palette, or
 // with predictors, whichever is smaller. Changes `argb`.
-fn lossless_stream(argb: mut &[uint], width: uint, height: uint) ByteBuffer {
+fn lossless_stream(argb: local mut &[uint], width: uint, height: uint) ByteBuffer {
     let palette = LlPalette.find(argb)
     let best: ?ByteBuffer = null
     if isset(palette) {
@@ -155,7 +155,7 @@ fn write_indexed(bits: LlWriter, argb: local &[uint], width: uint, height: uint,
 }
 
 // Subtract-green, predictor and color transforms, then the residuals; changes `argb`
-fn write_predicted(bits: LlWriter, argb: mut &[uint], width: uint, height: uint) {
+fn write_predicted(bits: LlWriter, argb: local mut &[uint], width: uint, height: uint) {
     bits.write(1, 1)
     bits.write(TRANSFORM_SUBTRACT_GREEN, 2)
     each argb as pixel, i {
@@ -432,7 +432,7 @@ fn transform_color(argb: uint, element: uint) uint {
 }
 
 // Applies each block's multipliers
-fn apply_multipliers(residuals: mut &[uint], multipliers: local &[uint], width: uint, height: uint) {
+fn apply_multipliers(residuals: local mut &[uint], multipliers: local &[uint], width: uint, height: uint) {
     let blocks_per_row = (width + (1 << COLOR_BITS) - 1) >> COLOR_BITS
     let y: uint = 0
     while y < height {
@@ -571,7 +571,7 @@ fn pair_hash(pixels: local &[uint], i: uint) uint {
     return ((key * 2654435761) & 0xffffffff) >> (32 - HASH_BITS)
 }
 
-fn insert_pair(pixels: local &[uint], i: uint, heads: mut &[u32], chain: mut &[u32]) {
+fn insert_pair(pixels: local &[uint], i: uint, heads: local mut &[u32], chain: local mut &[u32]) {
     let hash = pair_hash(pixels, i)
     chain[i] = heads[hash]
     heads[hash] = (i + 1).to(u32)
@@ -903,7 +903,7 @@ fn huffman_lengths(counts: local &[uint], limit: uint) mut &[u8] {
     }
 }
 
-fn heap_sort(keys: mut &[uint]) {
+fn heap_sort(keys: local mut &[uint]) {
     let n = keys.length
     let start = n / 2
     while start > 0 {
@@ -920,7 +920,7 @@ fn heap_sort(keys: mut &[uint]) {
     }
 }
 
-fn sift_down(keys: mut &[uint], start: uint, end: uint) {
+fn sift_down(keys: local mut &[uint], start: uint, end: uint) {
     let root = start
     while 2 * root + 1 < end {
         let child = 2 * root + 1

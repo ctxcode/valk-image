@@ -195,7 +195,7 @@ class GifFrame {
     transparent: int
 
     // Paints the frame onto the canvas, leaving its transparent pixels
-    fn draw(canvas: mut &[u8], canvas_width: uint) {
+    fn draw(canvas: local mut &[u8], canvas_width: uint) {
         let canvas_height = canvas.length / 4 / canvas_width
         let colors = this.palette.length / 3
         let y: uint = 0
@@ -227,7 +227,7 @@ class GifFrame {
     }
 
     // "Restore to background": the frame's area becomes transparent
-    fn clear(canvas: mut &[u8], canvas_width: uint) {
+    fn clear(canvas: local mut &[u8], canvas_width: uint) {
         let canvas_height = canvas.length / 4 / canvas_width
         let y = this.top
         while y < this.top + this.height && y < canvas_height {
@@ -362,7 +362,7 @@ fn gif_lzw_decode(data: local &[u8], input: GifInput, min_code_size: uint, count
 
 // Rows of an interlaced frame come in four passes: every 8th from 0, every 8th from 4, every
 // 4th from 2, every 2nd from 1
-fn gif_deinterlace(indexes: mut &[u8], width: uint, height: uint) mut &[u8] {
+fn gif_deinterlace(indexes: local mut &[u8], width: uint, height: uint) mut &[u8] {
     let out = [u8]{ 0 x indexes.length }
     let row: uint = 0
     let pass: uint = 0
