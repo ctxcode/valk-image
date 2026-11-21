@@ -27,15 +27,15 @@ test "BMP: every uncompressed depth decodes to the reference pixels" {
 
 test "BMP: unsupported and malformed files are reported" {
     image.decode_bmp(asset("photo-rle.bmp")) ! {
-        assert(E.code == E.unsupported)
+        assert(E is .unsupported)
         assert(E.message.contains("Run-length"))
     }
     let data = asset("photo-24.bmp")
-    image.decode_bmp(data.range(0, data.bytes - 10)) ! assert(E.code == E.invalid)
-    image.decode_bmp("BM") ! assert(E.code == E.invalid)
+    image.decode_bmp(data.range(0, data.bytes - 10)) ! assert(E is .invalid)
+    image.decode_bmp("BM") ! assert(E is .invalid)
     // An OS/2 header is 12 bytes
     let os2 = "BM" + "\x00\x00\x00\x00\x00\x00\x00\x00\x1a\x00\x00\x00" + "\x0c\x00\x00\x00\x01\x00\x01\x00\x01\x00\x18\x00" + "\x00\x00\x00\x00"
-    image.decode_bmp(os2) ! assert(E.code == E.unsupported)
+    image.decode_bmp(os2) ! assert(E is .unsupported)
 }
 
 test "BMP: encoding round-trips every channel count exactly" {

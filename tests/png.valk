@@ -70,17 +70,17 @@ test "PNG: interlaced (Adam7) files decode like their plain versions" {
 
 test "PNG: malformed files are reported" {
     image.decode_png(asset("bad-crc.png")) ! {
-        assert(E.code == E.invalid)
+        assert(E is .invalid)
         assert(E.message.contains("CRC"))
     }
     image.decode("not an image") ! {
-        assert(E.code == E.invalid)
+        assert(E is .invalid)
     }
     image.decode("GIF89a") ! {
-        assert(E.code == E.invalid)
+        assert(E is .invalid)
     }
     image.decode_png("\x89PNG\r\n\x1a\n") ! {
-        assert(E.code == E.invalid)
+        assert(E is .invalid)
     }
 }
 

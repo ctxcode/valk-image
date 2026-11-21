@@ -14,13 +14,6 @@ Namespaces: [main](#main)
 + value MAX_PIXELS (64 * 1024 * 1024)
 ```
 
-## Errors for 'main'
-
-```js
-// Thrown by the decoders, encoders and the operations that take coordinates.
-error ImageError (invalid, unsupported, too_large, range) payload { message: String ("") }
-```
-
 ## Enums for 'main'
 
 ```js
@@ -160,5 +153,18 @@ error ImageError (invalid, unsupported, too_large, range) payload { message: Str
     + fn to_rgba() Image
     // Encodes the image by the extension of `path` (`.png`, `.jpg`/`.jpeg`, `.webp`, `.gif` or `.bmp`) and writes it there, with each encoder's defaults; WebP is lossy.
     + fn write(path: String) void !ImageError
+}
+```
+
+```js
+// Thrown by the decoders, encoders and the operations that take coordinates.
++ union ImageError {
+    invalid(String)
+    unsupported(String)
+    too_large(String)
+    range(String)
+
+    + get message: String
+    + fn to_string() String
 }
 ```

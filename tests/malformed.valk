@@ -18,7 +18,7 @@ test "Malformed: an over-subscribed JPEG Huffman table" {
     let bad = splice(data, at + 5, "\x03\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
     let failed = false
     image.decode_jpeg(bad) ! {
-        assert(E.code == E.invalid && E.message.contains("over-subscribed"))
+        assert(E is .invalid && E.message.contains("over-subscribed"))
         failed = true
     }
     assert(failed)
@@ -80,7 +80,7 @@ test "Malformed: GIF frames larger than the canvas count towards MAX_PIXELS" {
     assert(first.width == 1 && first.height == 1)
     let failed = false
     image.decode_gif_animation(buf) ! {
-        assert(E.code == E.too_large)
+        assert(E is .too_large)
         failed = true
     }
     assert(failed)
@@ -97,7 +97,7 @@ test "Malformed: a huge PNG with almost no data" {
     bad = splice(bad, at + 17, crc.to_string())
     let failed = false
     image.decode_png(bad) ! {
-        assert(E.code == E.invalid && E.message.contains("wrong size"))
+        assert(E is .invalid && E.message.contains("wrong size"))
         failed = true
     }
     assert(failed)
@@ -110,7 +110,7 @@ test "Malformed: a JPEG declaring far more MCUs than its data can hold" {
     let bad = splice(data, at + 5, "\x1f\x40\x1f\x40")
     let failed = false
     image.decode_jpeg(bad) ! {
-        assert(E.code == E.invalid && E.message.contains("too short"))
+        assert(E is .invalid && E.message.contains("too short"))
         failed = true
     }
     assert(failed)
@@ -122,7 +122,7 @@ test "Malformed: a GIF frame declaring far more pixels than its data can hold" {
     buf.write("\x2c\x00\x00\x00\x00\xff\xff\x00\x04\x00\x02\x02\x44\x01\x00\x3b")
     let failed = false
     image.decode_gif(buf) ! {
-        assert(E.code == E.invalid && E.message.contains("too short"))
+        assert(E is .invalid && E.message.contains("too short"))
         failed = true
     }
     assert(failed)
@@ -135,7 +135,7 @@ test "Malformed: a lossy WebP declaring far more macroblocks than its data holds
     let bad = splice(data, at + 14, "\x40\x1f\x40\x1f")
     let failed = false
     image.decode_webp(bad) ! {
-        assert(E.code == E.invalid && E.message.contains("ends early"))
+        assert(E is .invalid && E.message.contains("ends early"))
         failed = true
     }
     assert(failed)
@@ -159,7 +159,7 @@ test "Malformed: a lossless WebP cut short with its sizes fixed up" {
     bad = splice(bad, 16, size.to_string())
     let failed = false
     image.decode_webp(bad) ! {
-        assert(E.code == E.invalid && E.message.contains("ends early"))
+        assert(E is .invalid && E.message.contains("ends early"))
         failed = true
     }
     assert(failed)

@@ -159,15 +159,15 @@ class Vp8Decoder {
 
     fn decode() !ImageError {
         let data = this.data
-        if data.length < 10 : throw .invalid { message: "Truncated VP8 frame" }
+        if data.length < 10 : throw .invalid("Truncated VP8 frame")
         let tag = data[0].to(uint) | (data[1].to(uint) << 8) | (data[2].to(uint) << 16)
-        if (tag & 1) != 0 : throw .unsupported { message: "VP8 inter frame" }
+        if (tag & 1) != 0 : throw .unsupported("VP8 inter frame")
         let first_partition_size = tag >> 5
-        if data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a : throw .invalid { message: "Bad VP8 start code" }
+        if data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a : throw .invalid("Bad VP8 start code")
         this.width = data[6].to(uint) | ((data[7] & 0x3f).to(uint) << 8)
         this.height = data[8].to(uint) | ((data[9] & 0x3f).to(uint) << 8)
-        if this.width == 0 || this.height == 0 : throw .invalid { message: "Empty VP8 frame" }
-        if this.width * this.height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+        if this.width == 0 || this.height == 0 : throw .invalid("Empty VP8 frame")
+        if this.width * this.height > MAX_PIXELS : throw .too_large("The image exceeds MAX_PIXELS")
         this.mbw = (this.width + 15) >> 4
         this.mbh = (this.height + 15) >> 4
         this.y_stride = this.mbw * 16
@@ -184,7 +184,7 @@ class Vp8Decoder {
             this.token_probs[i] = default_token_probs[i].to(uint)
             i++
         }
-        if 10 + first_partition_size > data.length : throw .invalid { message: "Truncated VP8 partition" }
+        if 10 + first_partition_size > data.length : throw .invalid("Truncated VP8 partition")
         let fp = BoolDecoder{ data: data, pos: 10, end: 10 + first_partition_size }
         this.fp = fp
         // Color space and clamping type: nothing to do for either
@@ -203,7 +203,7 @@ class Vp8Decoder {
         }
         this.use_skip_prob = fp.read_bit(UNIFORM_PROB)
         if this.use_skip_prob : this.skip_prob = fp.read_uint(UNIFORM_PROB, 8)
-        if fp.eof : throw .invalid { message: "VP8 header ends early" }
+        if fp.eof : throw .invalid("VP8 header ends early")
 
         let mby: uint = 0
         while mby < this.mbh {
@@ -223,8 +223,8 @@ class Vp8Decoder {
                 mbx++
             }
             // Checked per row so a short file fails before decoding the rest of its size
-            if fp.eof : throw .invalid { message: "VP8 data ends early" }
-            each this.partitions as partition : if partition.eof : throw .invalid { message: "VP8 data ends early" }
+            if fp.eof : throw .invalid("VP8 data ends early")
+            each this.partitions as partition : if partition.eof : throw .invalid("VP8 data ends early")
             mby++
         }
         if this.filter_level != 0 {
@@ -308,7 +308,7 @@ class Vp8Decoder {
     fn parse_partitions(fp: BoolDecoder, start: uint) !ImageError {
         let count: uint = 1 << fp.read_uint(UNIFORM_PROB, 2)
         let sizes_bytes = 3 * (count - 1)
-        if start + sizes_bytes > this.data.length : throw .invalid { message: "Truncated VP8 partition sizes" }
+        if start + sizes_bytes > this.data.length : throw .invalid("Truncated VP8 partition sizes")
         let pos = start + sizes_bytes
         let i: uint = 0
         while i < count {
@@ -316,7 +316,7 @@ class Vp8Decoder {
             if i < count - 1 {
                 let at = start + i * 3
                 size = this.data[at].to(uint) | (this.data[at + 1].to(uint) << 8) | (this.data[at + 2].to(uint) << 16)
-                if pos + size > this.data.length : throw .invalid { message: "Truncated VP8 partition" }
+                if pos + size > this.data.length : throw .invalid("Truncated VP8 partition")
             }
             this.partitions.append(BoolDecoder{ data: this.data, pos: pos, end: pos + size })
             pos += size
@@ -1198,7 +1198,7 @@ fn upsample_plane(plane: local &[u8], stride: uint, pw: uint, ph: uint, width: u
 // The ALPH chunk: raw or losslessly compressed alpha samples, optionally predicted
 // from their neighbors
 fn decode_alpha(chunk: String, image: Image) !ImageError {
-    if chunk.bytes < 1 : throw .invalid { message: "Empty alpha chunk" }
+    if chunk.bytes < 1 : throw .invalid("Empty alpha chunk")
     let header = chunk[0].to(uint)
     let compression = header & 3
     let filter = (header >> 2) & 3
@@ -1206,7 +1206,7 @@ fn decode_alpha(chunk: String, image: Image) !ImageError {
     let height = image.height
     let alpha = [u8]{ 0 x width * height }
     if compression == 0 {
-        if chunk.bytes < 1 + width * height : throw .invalid { message: "Truncated alpha data" }
+        if chunk.bytes < 1 + width * height : throw .invalid("Truncated alpha data")
         mem.copy(chunk.view(1, width * height), alpha)
     } else if compression == 1 {
         // A VP8L image stream without its header; the green channel carries alpha
@@ -1220,7 +1220,7 @@ fn decode_alpha(chunk: String, image: Image) !ImageError {
             i++
         }
     } else {
-        throw .invalid { message: "Unknown alpha compression" }
+        throw .invalid("Unknown alpha compression")
     }
     if filter != 0 {
         let y: uint = 0

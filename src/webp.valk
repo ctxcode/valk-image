@@ -15,7 +15,7 @@ use valk.mem
 /// alpha plane. The image has 4 channels when the file declares an alpha channel,
 /// 3 otherwise. Animated files throw `unsupported`; malformed files throw `invalid`.
 + fn decode_webp(data: local &[u8]) Image !ImageError {
-    if !is_webp(data) : throw .invalid { message: "Not a WebP file" }
+    if !is_webp(data) : throw .invalid("Not a WebP file")
     let riff_size = read_u32_le(data, 4).to(uint)
     let end = riff_size + 8 < data.length ? riff_size + 8 : data.length
     let pos: uint = 12
@@ -24,25 +24,25 @@ use valk.mem
     while pos + 8 <= end {
         let fourcc = data.view(pos, 4)
         let size = read_u32_le(data, pos + 4).to(uint)
-        if pos + 8 + size > end : throw .invalid { message: "Truncated WebP chunk" }
+        if pos + 8 + size > end : throw .invalid("Truncated WebP chunk")
         let body = data.view(pos + 8, size)
         if mem.equals(fourcc, "VP8L") {
             return decode_vp8l(body) !>
         } else if mem.equals(fourcc, "VP8 ") {
             return decode_vp8(body, alpha_chunk, has_alpha_flag) !>
         } else if mem.equals(fourcc, "VP8X") {
-            if size < 10 : throw .invalid { message: "Bad VP8X chunk" }
-            if (body[0] & 0x02) != 0 : throw .unsupported { message: "Animated WebP" }
+            if size < 10 : throw .invalid("Bad VP8X chunk")
+            if (body[0] & 0x02) != 0 : throw .unsupported("Animated WebP")
             has_alpha_flag = (body[0] & 0x10) != 0
         } else if mem.equals(fourcc, "ALPH") {
             alpha_chunk = body.to_string()
         } else if mem.equals(fourcc, "ANIM") || mem.equals(fourcc, "ANMF") {
-            throw .unsupported { message: "Animated WebP" }
+            throw .unsupported("Animated WebP")
         }
         // ICCP, EXIF, XMP and unknown chunks are skipped; chunks are padded to even sizes
         pos += 8 + size + (size % 2)
     }
-    throw .invalid { message: "WebP without image data" }
+    throw .invalid("WebP without image data")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -92,7 +92,7 @@ class LlCode {
         let i: uint = 0
         while i < lengths.length {
             let l = lengths[i].to(uint)
-            if l > 15 : throw .invalid { message: "Bad Huffman code length" }
+            if l > 15 : throw .invalid("Bad Huffman code length")
             if l > 0 {
                 code.counts[l]++
                 used++
@@ -100,7 +100,7 @@ class LlCode {
             }
             i++
         }
-        if used == 0 : throw .invalid { message: "Empty Huffman code" }
+        if used == 0 : throw .invalid("Empty Huffman code")
         if used == 1 {
             code.single = last.to(int)
             return code
@@ -110,10 +110,10 @@ class LlCode {
         let l: uint = 1
         while l <= 15 {
             left = left * 2 - code.counts[l].to(int)
-            if left < 0 : throw .invalid { message: "Over-subscribed Huffman code" }
+            if left < 0 : throw .invalid("Over-subscribed Huffman code")
             l++
         }
-        if left != 0 : throw .invalid { message: "Incomplete Huffman code" }
+        if left != 0 : throw .invalid("Incomplete Huffman code")
         // Symbols in code order, and the fast table from their canonical codes
         let offsets = [uint]{ 0 x 17 }
         l = 1
@@ -243,7 +243,7 @@ class LlDecoder {
             value = value << 1
             len++
         }
-        throw .invalid { message: "Bad Huffman code" }
+        throw .invalid("Bad Huffman code")
     }
 
     fn read_code(alphabet_size: uint) LlCode !ImageError {
@@ -253,11 +253,11 @@ class LlDecoder {
             let count = this.read_bits(1) + 1
             let first_bits: uint = this.read_bits(1) == 1 ? 8 : 1
             let first = this.read_bits(first_bits)
-            if first >= alphabet_size : throw .invalid { message: "Huffman symbol outside the alphabet" }
+            if first >= alphabet_size : throw .invalid("Huffman symbol outside the alphabet")
             lengths[first] = 1
             if count == 2 {
                 let second = this.read_bits(8)
-                if second >= alphabet_size : throw .invalid { message: "Huffman symbol outside the alphabet" }
+                if second >= alphabet_size : throw .invalid("Huffman symbol outside the alphabet")
                 lengths[second] = 1
             }
             return LlCode.build(lengths) !>
@@ -275,7 +275,7 @@ class LlDecoder {
         if this.read_bits(1) == 1 {
             let length_bits = 2 + 2 * this.read_bits(3)
             max_symbol = 2 + this.read_bits(length_bits)
-            if max_symbol > alphabet_size : throw .invalid { message: "Bad Huffman code length count" }
+            if max_symbol > alphabet_size : throw .invalid("Bad Huffman code length count")
         }
         let symbol: uint = 0
         let previous: u8 = 8
@@ -292,7 +292,7 @@ class LlDecoder {
                 let extra: uint = code_length == 16 ? 2 : (code_length == 17 ? 3 : 7)
                 let base: uint = code_length == 18 ? 11 : 3
                 let repeat = base + this.read_bits(extra)
-                if symbol + repeat > alphabet_size : throw .invalid { message: "Huffman code lengths overflow the alphabet" }
+                if symbol + repeat > alphabet_size : throw .invalid("Huffman code lengths overflow the alphabet")
                 let r: uint = 0
                 while r < repeat {
                     lengths[symbol++] = repeat_value
@@ -320,7 +320,7 @@ class LlDecoder {
         let cache_bits: uint = 0
         if this.read_bits(1) == 1 {
             cache_bits = this.read_bits(4)
-            if cache_bits < 1 || cache_bits > 11 : throw .invalid { message: "Bad color cache size" }
+            if cache_bits < 1 || cache_bits > 11 : throw .invalid("Bad color cache size")
         }
         // The main image may pick its entropy group per block from a meta image
         let meta: ?mut &[uint] = null
@@ -365,7 +365,7 @@ class LlDecoder {
         let group = groups[0]
         let pos: uint = 0
         while pos < total {
-            if this.acc_bits < this.padding : throw .invalid { message: "Lossless data ends early" }
+            if this.acc_bits < this.padding : throw .invalid("Lossless data ends early")
             if isset(meta) {
                 let x = pos % width
                 let y = pos / width
@@ -385,7 +385,7 @@ class LlDecoder {
                 let distance_symbol = this.read_symbol(group.distance) !>
                 let distance_code = this.read_prefixed(distance_symbol)
                 let distance = plane_distance(distance_code, width)
-                if distance > pos || pos + length > total : throw .invalid { message: "Back reference outside the image" }
+                if distance > pos || pos + length > total : throw .invalid("Back reference outside the image")
                 let i: uint = 0
                 while i < length {
                     let argb = pixels[pos - distance]
@@ -396,14 +396,14 @@ class LlDecoder {
                 }
             } else {
                 let index = code - GREEN_LITERALS - LENGTH_CODES
-                if cache_bits == 0 || index >= cache.length : throw .invalid { message: "Color cache index without a cache" }
+                if cache_bits == 0 || index >= cache.length : throw .invalid("Color cache index without a cache")
                 let argb = cache[index]
                 pixels[pos] = argb
                 cache[cache_hash(argb, cache_bits)] = argb
                 pos++
             }
         }
-        if this.acc_bits < this.padding : throw .invalid { message: "Lossless data ends early" }
+        if this.acc_bits < this.padding : throw .invalid("Lossless data ends early")
         return pixels
     }
 
@@ -430,15 +430,15 @@ fn plane_distance(code: uint, width: uint) uint {
 }
 
 fn decode_vp8l(data: local &[u8]) Image !ImageError {
-    if data.length < 5 || data[0] != VP8L_SIGNATURE : throw .invalid { message: "Bad VP8L header" }
+    if data.length < 5 || data[0] != VP8L_SIGNATURE : throw .invalid("Bad VP8L header")
     let bytes = [u8]{ 0 x data.length - 1 }
     mem.copy(data.view(1, data.length - 1), bytes)
     let decoder = LlDecoder{ data: bytes }
     let width = decoder.read_bits(14) + 1
     let height = decoder.read_bits(14) + 1
     let has_alpha = decoder.read_bits(1) == 1
-    if decoder.read_bits(3) != 0 : throw .invalid { message: "Unknown VP8L version" }
-    if width * height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
+    if decoder.read_bits(3) != 0 : throw .invalid("Unknown VP8L version")
+    if width * height > MAX_PIXELS : throw .too_large("The image exceeds MAX_PIXELS")
     let pixels = decoder.read_image(width, height) !>
     return argb_to_image(pixels, width, height, has_alpha ? 4 : 3) !>
 }
@@ -451,7 +451,7 @@ extend LlDecoder {
         let seen: uint = 0
         while this.read_bits(1) == 1 {
             let type = this.read_bits(2)
-            if (seen & (1 << type)) != 0 : throw .invalid { message: "Repeated VP8L transform" }
+            if (seen & (1 << type)) != 0 : throw .invalid("Repeated VP8L transform")
             seen = seen | (1 << type)
             let transform = LlTransform{ type: type }
             if type == TRANSFORM_PREDICTOR || type == TRANSFORM_COLOR {

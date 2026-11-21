@@ -20,7 +20,7 @@ extend Image {
     /// Scaling works in two passes, rows then columns, so a large image costs about
     /// `width * height` weighted sums per pass. Throws `range` for an empty size.
     + fn resize(width: uint, height: uint, filter: Filter (Filter.lanczos)) SELF !ImageError {
-        if width == 0 || height == 0 : throw .range { message: "Empty resize" }
+        if width == 0 || height == 0 : throw .range("Empty resize")
         if width == this.width && height == this.height : return this.clone()
         if filter == Filter.nearest : return this.resize_nearest(width, height) !>
         let pass = this.resample_rows(width, filter) !>
@@ -40,7 +40,7 @@ extend Image {
     /// Returns exactly `width` by `height`: the image is scaled to cover that size and the
     /// overflow is cropped away evenly on both sides.
     + fn cover(width: uint, height: uint, filter: Filter (Filter.lanczos)) SELF !ImageError {
-        if width == 0 || height == 0 : throw .range { message: "Empty size" }
+        if width == 0 || height == 0 : throw .range("Empty size")
         let by_width = height * this.width <= width * this.height
         let w = by_width ? width : (height * this.width + this.height / 2) / this.height
         let h = by_width ? (width * this.height + this.width / 2) / this.width : height

@@ -64,9 +64,9 @@ test "GIF: truncated and malformed files" {
     let cut = image.decode_gif_animation(data.range(0, data.bytes - 12)) !!
     assert(cut.frames.length == 3)
     let photo = asset("gif-photo.gif")
-    image.decode_gif(photo.range(0, 20)) ! assert(E.code == E.invalid)
-    image.decode_gif("GIF89a") ! assert(E.code == E.invalid)
-    image.decode_gif("not a gif") ! assert(E.code == E.invalid)
+    image.decode_gif(photo.range(0, 20)) ! assert(E is .invalid)
+    image.decode_gif("GIF89a") ! assert(E is .invalid)
+    image.decode_gif("not a gif") ! assert(E is .invalid)
     assert(!image.is_gif("GIF90a"))
 }
 
@@ -155,9 +155,9 @@ test "GIF: writing animations" {
 }
 
 test "GIF: what writing refuses" {
-    image.Animation {}.encode_gif() ! assert(E.code == E.range)
+    image.Animation {}.encode_gif() ! assert(E is .range)
     let mixed = image.Animation { frames: .{ frame(noise(4, 4), 0), frame(noise(4, 5), 0) } }
-    mixed.encode_gif() ! assert(E.code == E.range)
+    mixed.encode_gif() ! assert(E is .range)
     let wide = image.Image.new(70000, 1, 1) !!
-    wide.encode_gif() ! assert(E.code == E.range)
+    wide.encode_gif() ! assert(E is .range)
 }

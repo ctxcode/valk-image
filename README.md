@@ -119,9 +119,11 @@ The resize filters are `image.Filter.nearest`, `box`, `bilinear`, `bicubic` and
 
 ### Errors
 
-`ImageError` has four codes: `invalid` (the data is not that format), `unsupported`
-(a valid file using a feature this library does not read), `too_large` (more than
-`image.MAX_PIXELS` pixels) and `range` (a coordinate or size outside the image).
+`ImageError` is a tagged union with four variants, each carrying a message: `invalid(String)`
+(the data is not that format), `unsupported(String)` (a valid file using a feature this
+library does not read), `too_large(String)` (more than `image.MAX_PIXELS` pixels) and
+`range(String)` (a coordinate or size outside the image). Read `E.message` or convert `E`
+directly to a `String`.
 
 ## Example: a thumbnail service
 

@@ -10,14 +10,14 @@ use valk.fs
     if is_webp(data) : return decode_webp(data) !>
     if is_gif(data) : return decode_gif(data) !>
     if is_bmp(data) : return decode_bmp(data) !>
-    throw .invalid { message: "Unknown image format" }
+    throw .invalid("Unknown image format")
 }
 
 /// Reads and decodes the image file at `path`.
 ///
 /// Throws `invalid` when the file cannot be read, with the reason in `message`.
 + fn read(path: String) Image !ImageError {
-    let data = fs.read(path) ! throw .invalid { message: "Cannot read " + path }
+    let data = fs.read(path) ! throw .invalid("Cannot read " + path)
     return decode(data) !>
 }
 
@@ -32,7 +32,7 @@ extend Image {
         else if ext == "webp" : data = this.encode_webp() !>
         else if ext == "gif" : data = this.encode_gif() !>
         else if ext == "bmp" : data = this.encode_bmp()
-        else : throw .unsupported { message: "Writing ." + ext + " files" }
-        fs.write(path, data) ! throw .invalid { message: "Cannot write " + path }
+        else : throw .unsupported("Writing ." + ext + " files")
+        fs.write(path, data) ! throw .invalid("Cannot write " + path)
     }
 }

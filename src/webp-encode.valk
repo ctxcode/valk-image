@@ -77,7 +77,7 @@ fn lossless_stream(argb: local mut &[uint], width: uint, height: uint) ByteBuffe
 }
 
 fn check_webp_size(width: uint, height: uint) !ImageError {
-    if width > 16384 || height > 16384 : throw .range { message: "WebP images are limited to 16384 pixels per side" }
+    if width > 16384 || height > 16384 : throw .range("WebP images are limited to 16384 pixels per side")
 }
 
 // A RIFF WebP file holding one chunk

@@ -28,7 +28,7 @@ use valk.mem
 /// The result is RGBA when the frame has transparent pixels, RGB otherwise.
 + fn decode_gif(data: local &[u8]) Image !ImageError {
     let animation = read_gif(data, true) !>
-    let first = animation.frames.get(0) ! throw .invalid { message: "The GIF holds no image" }
+    let first = animation.frames.get(0) ! throw .invalid("The GIF holds no image")
     return first.image
 }
 
@@ -46,7 +46,7 @@ class GifInput {
     pos: uint (0)
 
     fn byte(data: local &[u8]) u8 !ImageError {
-        if this.pos >= data.length : throw .invalid { message: "The GIF ends early" }
+        if this.pos >= data.length : throw .invalid("The GIF ends early")
         return data[this.pos++]
     }
     fn u16(data: local &[u8]) uint !ImageError {
@@ -55,7 +55,7 @@ class GifInput {
         return low.to(uint) | (high.to(uint) << 8)
     }
     fn bytes(data: local &[u8], count: uint) String !ImageError {
-        if this.pos + count > data.length : throw .invalid { message: "The GIF ends early" }
+        if this.pos + count > data.length : throw .invalid("The GIF ends early")
         let out = data.view(this.pos, count).to_string()
         this.pos += count
         return out
@@ -66,20 +66,20 @@ class GifInput {
             let size = this.byte(data) !>
             if size == 0 : return
             this.pos += size.to(uint)
-            if this.pos > data.length : throw .invalid { message: "The GIF ends early" }
+            if this.pos > data.length : throw .invalid("The GIF ends early")
         }
     }
 }
 
 fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
-    if !is_gif(data) : throw .invalid { message: "Not a GIF" }
+    if !is_gif(data) : throw .invalid("Not a GIF")
     let input = GifInput { pos: 6 }
     let width = input.u16(data) !>
     let height = input.u16(data) !>
     let packed = input.byte(data) !>
     input.byte(data) !> // background colour; browsers show transparency instead
     input.byte(data) !> // pixel aspect ratio
-    if width == 0 || height == 0 : throw .invalid { message: "The GIF has no size" }
+    if width == 0 || height == 0 : throw .invalid("The GIF has no size")
     check_dimensions(width, height, 4) !>
     let global_palette: ?String = null
     if (packed & 0x80) != 0 : global_palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
@@ -105,7 +105,7 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
             let label = input.byte(data) !>
             if label == 0xF9 {
                 let size = input.byte(data) !>
-                if size < 4 : throw .invalid { message: "A graphic control extension is too short" }
+                if size < 4 : throw .invalid("A graphic control extension is too short")
                 let flags = input.byte(data) !>
                 delay = input.u16(data) !>
                 let index = input.byte(data) !>
@@ -138,7 +138,7 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
         }
         if block != 0x2C {
             if animation.frames.length > 0 : break
-            throw .invalid { message: "Unknown GIF block" }
+            throw .invalid("Unknown GIF block")
         }
 
         let frame = read_gif_frame(data, input, width, height, global_palette, transparent) ! {
@@ -149,7 +149,7 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
         // A frame larger than the canvas still costs its own size to decode
         let frame_pixels = frame.width * frame.height
         total_pixels += frame_pixels > canvas_size / 4 ? frame_pixels : canvas_size / 4
-        if total_pixels > MAX_PIXELS : throw .too_large { message: "The frames of the GIF hold more than MAX_PIXELS pixels" }
+        if total_pixels > MAX_PIXELS : throw .too_large("The frames of the GIF hold more than MAX_PIXELS pixels")
         // "Restore to previous" puts back the canvas from before this frame
         let before = disposal == 3 ? copy_bytes(canvas) : null
         frame.draw(canvas, width)
@@ -162,7 +162,7 @@ fn read_gif(data: local &[u8], first_only: bool) Animation !ImageError {
         transparent = -1
         disposal = 0
     }
-    if animation.frames.length == 0 : throw .invalid { message: "The GIF holds no image" }
+    if animation.frames.length == 0 : throw .invalid("The GIF holds no image")
 
     // No transparent pixel anywhere: RGB is enough
     let opaque = true
@@ -251,13 +251,13 @@ fn read_gif_frame(data: local &[u8], input: GifInput, canvas_width: uint, canvas
     let width = input.u16(data) !>
     let height = input.u16(data) !>
     let packed = input.byte(data) !>
-    if width * height > MAX_PIXELS : throw .too_large { message: "A frame of the GIF is too large" }
+    if width * height > MAX_PIXELS : throw .too_large("A frame of the GIF is too large")
     let palette = global_palette
     if (packed & 0x80) != 0 : palette = input.bytes(data, 3 * (1 << ((packed & 7) + 1).to(uint))) !>
-    let colors = palette ?! throw .invalid { message: "A GIF frame has no colour table" }
+    let colors = palette ?! throw .invalid("A GIF frame has no colour table")
     let min_code_size = input.byte(data) !>
     // A code takes at least 2 bits and stands for at most 4096 pixels
-    if width * height > (data.length - input.pos) * 16384 : throw .invalid { message: "The GIF data is too short for its size" }
+    if width * height > (data.length - input.pos) * 16384 : throw .invalid("The GIF data is too short for its size")
     let indexes = gif_lzw_decode(data, input, min_code_size.to(uint), width * height) !>
     if (packed & 0x40) != 0 : indexes = gif_deinterlace(indexes, width, height)
     return GifFrame { left: left, top: top, width: width, height: height, indexes: indexes, palette: colors, transparent: transparent }
@@ -266,7 +266,7 @@ fn read_gif_frame(data: local &[u8], input: GifInput, canvas_width: uint, canvas
 // The LZW code stream of a frame, spread over sub-blocks, decoded to `count` palette indexes.
 // Codes are read LSB first; a table entry is written back to front through its prefixes.
 fn gif_lzw_decode(data: local &[u8], input: GifInput, min_code_size: uint, count: uint) mut &[u8] !ImageError {
-    if min_code_size < 1 || min_code_size > 11 : throw .invalid { message: "A GIF frame has an invalid LZW code size" }
+    if min_code_size < 1 || min_code_size > 11 : throw .invalid("A GIF frame has an invalid LZW code size")
     let out = [u8]{ 0 x count }
     let prefix = [u16]{ 0 x 4096 }
     let suffix = [u8]{ 0 x 4096 }
@@ -317,7 +317,7 @@ fn gif_lzw_decode(data: local &[u8], input: GifInput, min_code_size: uint, count
         }
         if code == end : break
         if code > next || (code == next && previous == 4096) {
-            throw .invalid { message: "A GIF frame has a corrupt LZW code" }
+            throw .invalid("A GIF frame has a corrupt LZW code")
         }
 
         // The string of `code`, or for the code about to be made, the previous string plus
@@ -353,7 +353,7 @@ fn gif_lzw_decode(data: local &[u8], input: GifInput, min_code_size: uint, count
     if !blocks_done {
         if block_left > 0 {
             input.pos += block_left
-            if input.pos > data.length : throw .invalid { message: "The GIF ends early" }
+            if input.pos > data.length : throw .invalid("The GIF ends early")
         }
         input.skip_blocks(data) !>
     }
@@ -418,7 +418,7 @@ extend Animation {
     /// pixels, what is not transparent. Throws `range` for an animation without frames, frames
     /// of different sizes, or a side over 65535 pixels.
     + fn encode_gif(dither: bool (true)) String !ImageError {
-        let first = this.frames.get(0) ! throw .range { message: "An animation needs a frame" }
+        let first = this.frames.get(0) ! throw .range("An animation needs a frame")
         let width = first.image.width
         let height = first.image.height
         check_gif_size(width, height) !>
@@ -427,7 +427,7 @@ extend Animation {
         let clear = false
         each this.frames as frame, i {
             let img = frame.image
-            if img.width != width || img.height != height : throw .range { message: "Frame " + i + " is " + img.width + "x" + img.height + ", the first is " + width + "x" + height }
+            if img.width != width || img.height != height : throw .range("Frame " + i + " is " + img.width + "x" + img.height + ", the first is " + width + "x" + height)
             if !clear && has_transparency(img) : clear = true
         }
         let out = ByteBuffer.new(width * height / 2 + 1024)
@@ -453,7 +453,7 @@ extend Animation {
 }
 
 fn check_gif_size(width: uint, height: uint) !ImageError {
-    if width > 65535 || height > 65535 : throw .range { message: "GIF images are limited to 65535 pixels per side" }
+    if width > 65535 || height > 65535 : throw .range("GIF images are limited to 65535 pixels per side")
 }
 
 fn has_transparency(img: Image) bool {

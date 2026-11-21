@@ -13,7 +13,7 @@ extend Image {
     /// The alpha of an RGBA image is kept exactly, in an alpha chunk beside the lossy color.
     /// Throws `range` when a side exceeds 16383 pixels, the format's limit.
     + fn encode_webp(quality: uint (75)) String !ImageError {
-        if this.width > 16383 || this.height > 16383 : throw .range { message: "Lossy WebP images are limited to 16383 pixels per side" }
+        if this.width > 16383 || this.height > 16383 : throw .range("Lossy WebP images are limited to 16383 pixels per side")
         let encoder = Vp8Encoder.new(this, quality_index(quality > 100 ? 100 : quality))
         let frame = encoder.encode()
         if this.channels != 4 : return webp_file("VP8 ", frame)

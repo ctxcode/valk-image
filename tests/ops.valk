@@ -37,9 +37,9 @@ test "Image: creation, access and conversion" {
     assert(dark.to_gray().get(0, 0) == 30) // 100 * 0.299
     assert(dark.to_gray().to_rgb().get(0, 0, 2) == 30)
 
-    image.Image.new(0, 5) ! assert(E.code == E.range)
-    image.Image.new(5, 5, 2) ! assert(E.code == E.unsupported)
-    image.Image.new(100_000, 100_000) ! assert(E.code == E.too_large)
+    image.Image.new(0, 5) ! assert(E is .range && E.to_string() == E.message && "%{E}" == E.message)
+    image.Image.new(5, 5, 2) ! assert(E is .unsupported)
+    image.Image.new(100_000, 100_000) ! assert(E is .too_large)
 }
 
 test "Image: crop, flips and rotations" {
@@ -47,8 +47,8 @@ test "Image: crop, flips and rotations" {
     let c = img.crop(1, 0, 2, 2) !!
     assert(c.width == 2 && c.height == 2)
     assert(c.get(0, 0, 0) == 1 && c.get(1, 1, 0) == 2 && c.get(1, 1, 1) == 1)
-    img.crop(2, 0, 2, 1) ! assert(E.code == E.range)
-    img.crop(0, 0, 0, 1) ! assert(E.code == E.range)
+    img.crop(2, 0, 2, 1) ! assert(E is .range)
+    img.crop(0, 0, 0, 1) ! assert(E is .range)
 
     let h = img.flip_horizontal()
     assert(h.get(0, 0, 0) == 2 && h.get(2, 0, 0) == 0 && h.get(0, 1, 1) == 1)
@@ -110,7 +110,7 @@ test "Image: resize filters" {
         assert(wide.get(x, 0) >= wide.get(x - 1, 0))
         x++
     }
-    img.resize(0, 1) ! assert(E.code == E.range)
+    img.resize(0, 1) ! assert(E is .range)
 }
 
 test "Image: fit and cover" {

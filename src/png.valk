@@ -69,7 +69,7 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
 /// image, gray with alpha and palettes with transparency become RGBA, the rest RGB or RGBA
 /// as stored. Malformed files throw `invalid` with a message naming the chunk.
 + fn decode_png(data: local &[u8]) Image !ImageError {
-    if !is_png(data) : throw .invalid { message: "Not a PNG file" }
+    if !is_png(data) : throw .invalid("Not a PNG file")
     let pos: uint = 8
     let width: uint = 0
     let height: uint = 0
@@ -82,20 +82,20 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
     let seen_header = false
     let seen_end = false
     while !seen_end {
-        if pos + 12 > data.length : throw .invalid { message: "Truncated chunk" }
+        if pos + 12 > data.length : throw .invalid("Truncated chunk")
         let length = read_u32_be(data, pos).to(uint)
         let type = data.view(pos + 4, 4).to_string()
-        if pos + 12 + length > data.length : throw .invalid { message: "Truncated " + type + " chunk" }
+        if pos + 12 + length > data.length : throw .invalid("Truncated " + type + " chunk")
         let body = data.view(pos + 8, length)
         let crc = read_u32_be(data, pos + 8 + length)
-        if crc != compress.crc32(body, compress.crc32(type)) : throw .invalid { message: "Bad CRC in " + type + " chunk" }
+        if crc != compress.crc32(body, compress.crc32(type)) : throw .invalid("Bad CRC in " + type + " chunk")
         if type == "IHDR" {
-            if length != 13 : throw .invalid { message: "IHDR chunk has the wrong size" }
+            if length != 13 : throw .invalid("IHDR chunk has the wrong size")
             width = read_u32_be(body, 0).to(uint)
             height = read_u32_be(body, 4).to(uint)
             bit_depth = body[8]
             color_type = body[9]
-            if body[10] != 0 || body[11] != 0 : throw .invalid { message: "Unknown compression or filter method" }
+            if body[10] != 0 || body[11] != 0 : throw .invalid("Unknown compression or filter method")
             interlace = body[12]
             seen_header = true
         } else if type == "PLTE" {
@@ -110,10 +110,10 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
         // Ancillary chunks (text, gamma, ...) are skipped
         pos += 12 + length
     }
-    if !seen_header : throw .invalid { message: "Missing IHDR chunk" }
-    if interlace > 1 : throw .invalid { message: "Unknown interlace method" }
+    if !seen_header : throw .invalid("Missing IHDR chunk")
+    if interlace > 1 : throw .invalid("Unknown interlace method")
     if width == 0 || height == 0 || width > MAX_PIXELS || height > MAX_PIXELS || width * height > MAX_PIXELS {
-        throw .too_large { message: "The image exceeds MAX_PIXELS" }
+        throw .too_large("The image exceeds MAX_PIXELS")
     }
 
     // Samples per pixel as stored, and the channels of the image produced
@@ -127,7 +127,7 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
         out_channels = isset(trns) ? 4 : 3
     } else if color_type == 3 {
         samples = 1
-        if !isset(palette) : throw .invalid { message: "Palette image without a PLTE chunk" }
+        if !isset(palette) : throw .invalid("Palette image without a PLTE chunk")
         out_channels = isset(trns) ? 4 : 3
     } else if color_type == 4 {
         samples = 2
@@ -136,11 +136,11 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
         samples = 4
         out_channels = 4
     } else {
-        throw .invalid { message: "Unknown color type" }
+        throw .invalid("Unknown color type")
     }
-    if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 && bit_depth != 16 : throw .invalid { message: "Unknown bit depth" }
-    if (color_type == 2 || color_type == 4 || color_type == 6) && bit_depth < 8 : throw .invalid { message: "Bit depth too small for the color type" }
-    if color_type == 3 && bit_depth == 16 : throw .invalid { message: "16-bit palette" }
+    if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 && bit_depth != 16 : throw .invalid("Unknown bit depth")
+    if (color_type == 2 || color_type == 4 || color_type == 6) && bit_depth < 8 : throw .invalid("Bit depth too small for the color type")
+    if color_type == 3 && bit_depth == 16 : throw .invalid("16-bit palette")
 
     let bits_per_pixel = samples * bit_depth.to(uint)
     let bytes_per_pixel = bits_per_pixel < 8 ? 1 : bits_per_pixel / 8
@@ -156,8 +156,8 @@ fn write_png_chunk(out: ByteBuffer, type: String, data: local &[u8]) {
         if pw > 0 && ph > 0 : raw_size += ((pw * bits_per_pixel + 7) / 8 + 1) * ph
         pass++
     }
-    let raw = compress.unzlib(idat, raw_size) ! throw .invalid { message: "Corrupt image data" }
-    if raw.bytes != raw_size : throw .invalid { message: "Image data has the wrong size" }
+    let raw = compress.unzlib(idat, raw_size) ! throw .invalid("Corrupt image data")
+    if raw.bytes != raw_size : throw .invalid("Image data has the wrong size")
     // Allocated only now that the data has been found to fill it
     let image = Image.new(width, height, out_channels) !>
     let rows = [u8]{ 0 x raw_size }
@@ -255,7 +255,7 @@ fn unfilter_rows(rows: local mut &[u8], height: uint, stride: uint, bpp: uint) !
             } else if filter == 4 {
                 value += paeth(a, b, c)
             } else {
-                throw .invalid { message: "Unknown row filter" }
+                throw .invalid("Unknown row filter")
             }
             rows[at] = (value & 255).to(u8)
             x++

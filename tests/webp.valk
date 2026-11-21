@@ -42,15 +42,15 @@ test "WebP: lossy files with an alpha plane" {
 
 test "WebP: unsupported and malformed files are reported" {
     image.decode_webp(asset("webp-anim.webp")) ! {
-        assert(E.code == E.unsupported)
+        assert(E is .unsupported)
         assert(E.message.contains("Animated"))
     }
     let data = asset("webp-lossy-rgb.webp")
-    image.decode_webp(data.range(0, data.bytes / 2)) ! assert(E.code == E.invalid)
+    image.decode_webp(data.range(0, data.bytes / 2)) ! assert(E is .invalid)
     let lossless = asset("webp-ll-rgb.webp")
-    image.decode_webp(lossless.range(0, lossless.bytes - 40)) ! assert(E.code == E.invalid)
-    image.decode_webp("RIFF\x00\x00\x00\x00WEBP") ! assert(E.code == E.invalid)
-    image.decode_webp("not webp") ! assert(E.code == E.invalid)
+    image.decode_webp(lossless.range(0, lossless.bytes - 40)) ! assert(E is .invalid)
+    image.decode_webp("RIFF\x00\x00\x00\x00WEBP") ! assert(E is .invalid)
+    image.decode_webp("not webp") ! assert(E is .invalid)
     assert(!image.is_webp("RIFF"))
 }
 
@@ -162,7 +162,7 @@ test "WebP: lossless writing limits code lengths" {
     }
     assert(lossless_round_trip(img))
     let wide = image.Image.new(16385, 1, 1) !!
-    wide.encode_webp_lossless() ! assert(E.code == E.range)
+    wide.encode_webp_lossless() ! assert(E is .range)
 }
 
 test "WebP: lossy writing" {
@@ -205,5 +205,5 @@ test "WebP: lossy writing keeps alpha exactly" {
     let opaque = (image.decode_png(asset("photo.png")) !!).to_rgba()
     assert((image.decode_webp(opaque.encode_webp() !!) !!).channels == 3)
     let wide = image.Image.new(16384, 1, 1) !!
-    wide.encode_webp() ! assert(E.code == E.range)
+    wide.encode_webp() ! assert(E is .range)
 }

@@ -31,7 +31,7 @@ value FAST_BITS (9)
 /// Arithmetic-coded, lossless, 12-bit and CMYK files throw `unsupported`; malformed
 /// files throw `invalid`.
 + fn decode_jpeg(data: local &[u8]) Image !ImageError {
-    if !is_jpeg(data) : throw .invalid { message: "Not a JPEG file" }
+    if !is_jpeg(data) : throw .invalid("Not a JPEG file")
     let bytes = [u8]{ 0 x data.length }
     mem.copy(data, bytes)
     let decoder = Decoder{ data: bytes }
@@ -153,7 +153,7 @@ class Huffman {
         let total: uint = 0
         let l: uint = 0
         while l < 16 : total += counts[l++].to(uint)
-        if total > 256 || total > values.length : throw .invalid { message: "Huffman table has too many symbols" }
+        if total > 256 || total > values.length : throw .invalid("Huffman table has too many symbols")
         mem.copy(values.view(0, total), table.values)
         table.count = total
         let code: int = 0
@@ -163,7 +163,7 @@ class Huffman {
             let n = counts[l - 1].to(uint)
             table.mincode[l] = code
             table.valptr[l] = k
-            if code + n.to(int) > (1 << l) : throw .invalid { message: "Huffman table is over-subscribed" }
+            if code + n.to(int) > (1 << l) : throw .invalid("Huffman table is over-subscribed")
             let i: uint = 0
             while i < n {
                 if l <= FAST_BITS {
@@ -258,27 +258,27 @@ class Decoder {
             if marker == 0xd9 : break
             // Standalone markers carry no segment
             if marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7) : continue
-            if this.pos + 2 > this.data.length : throw .invalid { message: "Truncated segment" }
+            if this.pos + 2 > this.data.length : throw .invalid("Truncated segment")
             let length = ((this.data[this.pos].to(uint) << 8) | this.data[this.pos + 1].to(uint))
-            if length < 2 || this.pos + length > this.data.length : throw .invalid { message: "Truncated segment" }
+            if length < 2 || this.pos + length > this.data.length : throw .invalid("Truncated segment")
             let segment = this.data.view(this.pos + 2, length - 2)
             this.pos += length
             if marker == 0xc0 || marker == 0xc1 || marker == 0xc2 {
                 this.progressive = marker == 0xc2
                 this.parse_frame(segment) !>
             } else if marker == 0xc3 || marker == 0xc7 || marker == 0xcb || marker == 0xcf {
-                throw .unsupported { message: "Lossless JPEG" }
+                throw .unsupported("Lossless JPEG")
             } else if marker == 0xc5 || marker == 0xc6 || marker == 0xc9 || marker == 0xca || marker == 0xcd || marker == 0xce {
-                throw .unsupported { message: "Arithmetic-coded or hierarchical JPEG" }
+                throw .unsupported("Arithmetic-coded or hierarchical JPEG")
             } else if marker == 0xc4 {
                 this.parse_huffman_tables(segment) !>
             } else if marker == 0xdb {
                 this.parse_quant_tables(segment) !>
             } else if marker == 0xdd {
-                if segment.length < 2 : throw .invalid { message: "Bad DRI segment" }
+                if segment.length < 2 : throw .invalid("Bad DRI segment")
                 this.restart_interval = (segment[0].to(uint) << 8) | segment[1].to(uint)
             } else if marker == 0xda {
-                if !this.seen_frame : throw .invalid { message: "Scan before the frame header" }
+                if !this.seen_frame : throw .invalid("Scan before the frame header")
                 // Once a scan has run short of data, later scans would only decode more
                 // made-up zeros over the whole picture: skip them
                 if !this.overrun {
@@ -294,8 +294,8 @@ class Decoder {
             }
             // APPn, COM, DNL and the rest are skipped
         }
-        if !this.seen_frame : throw .invalid { message: "Missing frame header" }
-        if !seen_scan : throw .invalid { message: "Missing scan" }
+        if !this.seen_frame : throw .invalid("Missing frame header")
+        if !seen_scan : throw .invalid("Missing scan")
         return this.build_image() !>
     }
 
@@ -305,7 +305,7 @@ class Decoder {
         while true {
             while this.pos < data.length && data[this.pos] != 0xff : this.pos++
             while this.pos < data.length && data[this.pos] == 0xff : this.pos++
-            if this.pos >= data.length : throw .invalid { message: "Missing end of image" }
+            if this.pos >= data.length : throw .invalid("Missing end of image")
             let marker = data[this.pos]
             this.pos++
             // FF 00 is a stuffed byte inside entropy-coded data, not a marker
@@ -314,24 +314,24 @@ class Decoder {
     }
 
     fn parse_frame(segment: local &[u8]) !ImageError {
-        if this.seen_frame : throw .invalid { message: "Multiple frame headers" }
-        if segment.length < 6 : throw .invalid { message: "Bad frame header" }
-        if segment[0] != 8 : throw .unsupported { message: segment[0].to(uint).to(String) + "-bit samples" }
+        if this.seen_frame : throw .invalid("Multiple frame headers")
+        if segment.length < 6 : throw .invalid("Bad frame header")
+        if segment[0] != 8 : throw .unsupported(segment[0].to(uint).to(String) + "-bit samples")
         this.height = (segment[1].to(uint) << 8) | segment[2].to(uint)
         this.width = (segment[3].to(uint) << 8) | segment[4].to(uint)
         let count = segment[5].to(uint)
-        if this.height == 0 : throw .unsupported { message: "Height defined by a DNL marker" }
-        if this.width == 0 || this.width * this.height > MAX_PIXELS : throw .too_large { message: "The image exceeds MAX_PIXELS" }
-        if count == 4 : throw .unsupported { message: "CMYK JPEG" }
-        if count != 1 && count != 3 : throw .unsupported { message: count.to(String) + "-component JPEG" }
-        if segment.length < 6 + count * 3 : throw .invalid { message: "Bad frame header" }
+        if this.height == 0 : throw .unsupported("Height defined by a DNL marker")
+        if this.width == 0 || this.width * this.height > MAX_PIXELS : throw .too_large("The image exceeds MAX_PIXELS")
+        if count == 4 : throw .unsupported("CMYK JPEG")
+        if count != 1 && count != 3 : throw .unsupported(count.to(String) + "-component JPEG")
+        if segment.length < 6 + count * 3 : throw .invalid("Bad frame header")
         let i: uint = 0
         while i < count {
             let at = 6 + i * 3
             let h = (segment[at + 1] >> 4).to(uint)
             let v = (segment[at + 1] & 15).to(uint)
-            if h == 0 || h > 4 || v == 0 || v > 4 : throw .invalid { message: "Bad sampling factors" }
-            if segment[at + 2] > 3 : throw .invalid { message: "Bad quantization table id" }
+            if h == 0 || h > 4 || v == 0 || v > 4 : throw .invalid("Bad sampling factors")
+            if segment[at + 2] > 3 : throw .invalid("Bad quantization table id")
             this.components.append(Component{ id: segment[at], h: h, v: v, tq: segment[at + 2] })
             if h > this.hmax : this.hmax = h
             if v > this.vmax : this.vmax = v
@@ -347,7 +347,7 @@ class Decoder {
         this.mcus_x = (this.width + this.hmax * 8 - 1) / (this.hmax * 8)
         this.mcus_y = (this.height + this.vmax * 8 - 1) / (this.vmax * 8)
         // Every scan spends at least one bit per MCU
-        if (this.data.length - this.pos) * 8 < this.mcus_x * this.mcus_y : throw .invalid { message: "The JPEG data is too short for its size" }
+        if (this.data.length - this.pos) * 8 < this.mcus_x * this.mcus_y : throw .invalid("The JPEG data is too short for its size")
         each this.components as comp {
             comp.width = (this.width * comp.h + this.hmax - 1) / this.hmax
             comp.height = (this.height * comp.v + this.vmax - 1) / this.vmax
@@ -362,15 +362,15 @@ class Decoder {
     fn parse_huffman_tables(segment: local &[u8]) !ImageError {
         let pos: uint = 0
         while pos < segment.length {
-            if pos + 17 > segment.length : throw .invalid { message: "Bad Huffman table" }
+            if pos + 17 > segment.length : throw .invalid("Bad Huffman table")
             let class = segment[pos] >> 4
             let id = (segment[pos] & 15).to(uint)
-            if class > 1 || id > 3 : throw .invalid { message: "Bad Huffman table id" }
+            if class > 1 || id > 3 : throw .invalid("Bad Huffman table id")
             let counts = segment.view(pos + 1, 16)
             let total: uint = 0
             let i: uint = 0
             while i < 16 : total += counts[i++].to(uint)
-            if pos + 17 + total > segment.length : throw .invalid { message: "Bad Huffman table" }
+            if pos + 17 + total > segment.length : throw .invalid("Bad Huffman table")
             let table = Huffman.build(counts, segment.view(pos + 17, total)) !>
             if class == 0 : this.dc_tables[id] = table
             else : this.ac_tables[id] = table
@@ -383,9 +383,9 @@ class Decoder {
         while pos < segment.length {
             let precision = segment[pos] >> 4
             let id = (segment[pos] & 15).to(uint)
-            if id > 3 : throw .invalid { message: "Bad quantization table id" }
+            if id > 3 : throw .invalid("Bad quantization table id")
             let size: uint = precision == 0 ? 64 : 128
-            if pos + 1 + size > segment.length : throw .invalid { message: "Bad quantization table" }
+            if pos + 1 + size > segment.length : throw .invalid("Bad quantization table")
             let table = [u16]{ 0 x 64 }
             let i: uint = 0
             while i < 64 {
@@ -399,9 +399,9 @@ class Decoder {
     }
 
     fn parse_scan(segment: local &[u8]) !ImageError {
-        if segment.length < 1 : throw .invalid { message: "Bad scan header" }
+        if segment.length < 1 : throw .invalid("Bad scan header")
         let count = segment[0].to(uint)
-        if count == 0 || count > this.components.length || segment.length < 4 + count * 2 : throw .invalid { message: "Bad scan header" }
+        if count == 0 || count > this.components.length || segment.length < 4 + count * 2 : throw .invalid("Bad scan header")
         this.scan = Array[Component]{}
         let i: uint = 0
         while i < count {
@@ -409,12 +409,12 @@ class Decoder {
             let tables = segment[2 + i * 2]
             let found: ?Component = null
             each this.components as comp : if comp.id == id : found = comp
-            if !isset(found) : throw .invalid { message: "Scan names an unknown component" }
+            if !isset(found) : throw .invalid("Scan names an unknown component")
             let comp = found
             comp.td = tables >> 4
             comp.ta = tables & 15
-            if comp.td > 3 || comp.ta > 3 : throw .invalid { message: "Bad Huffman table id in scan" }
-            if !isset(this.quant[comp.tq.to(uint)]) : throw .invalid { message: "Scan uses a missing quantization table" }
+            if comp.td > 3 || comp.ta > 3 : throw .invalid("Bad Huffman table id in scan")
+            if !isset(this.quant[comp.tq.to(uint)]) : throw .invalid("Scan uses a missing quantization table")
             comp.pred = 0
             this.scan.append(comp)
             i++
@@ -427,18 +427,18 @@ class Decoder {
         if this.progressive {
             // A DC scan covers coefficient 0 only and may interleave components; an AC
             // scan covers a band of one component. Refinements add one bit per scan.
-            if this.se > 63 || this.ss > this.se : throw .invalid { message: "Bad spectral selection" }
-            if this.ss == 0 && this.se != 0 : throw .invalid { message: "A DC scan cannot carry AC coefficients" }
-            if this.ss > 0 && count != 1 : throw .invalid { message: "An AC scan must hold one component" }
-            if this.al > 13 || (this.ah != 0 && this.ah != this.al + 1) : throw .invalid { message: "Bad successive approximation" }
+            if this.se > 63 || this.ss > this.se : throw .invalid("Bad spectral selection")
+            if this.ss == 0 && this.se != 0 : throw .invalid("A DC scan cannot carry AC coefficients")
+            if this.ss > 0 && count != 1 : throw .invalid("An AC scan must hold one component")
+            if this.al > 13 || (this.ah != 0 && this.ah != this.al + 1) : throw .invalid("Bad successive approximation")
         } else if this.ss != 0 || this.se != 63 || this.ah != 0 || this.al != 0 {
-            throw .invalid { message: "Baseline scan with progressive parameters" }
+            throw .invalid("Baseline scan with progressive parameters")
         }
         each this.scan as comp {
             let needs_dc = this.ss == 0 && this.ah == 0
             let needs_ac = this.ss > 0 || !this.progressive
-            if needs_dc && !isset(this.dc_tables[comp.td.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
-            if needs_ac && !isset(this.ac_tables[comp.ta.to(uint)]) : throw .invalid { message: "Scan uses a missing Huffman table" }
+            if needs_dc && !isset(this.dc_tables[comp.td.to(uint)]) : throw .invalid("Scan uses a missing Huffman table")
+            if needs_ac && !isset(this.ac_tables[comp.ta.to(uint)]) : throw .invalid("Scan uses a missing Huffman table")
         }
     }
 
@@ -507,14 +507,14 @@ class Decoder {
         let data = this.data
         while this.pos < data.length && data[this.pos] != 0xff : this.pos++
         while this.pos + 1 < data.length && data[this.pos] == 0xff && data[this.pos + 1] == 0xff : this.pos++
-        if this.pos + 1 >= data.length || data[this.pos + 1] < 0xd0 || data[this.pos + 1] > 0xd7 : throw .invalid { message: "Missing restart marker" }
+        if this.pos + 1 >= data.length || data[this.pos + 1] < 0xd0 || data[this.pos + 1] > 0xd7 : throw .invalid("Missing restart marker")
         this.pos += 2
         this.eobrun = 0
         each this.scan as comp : comp.pred = 0
     }
 
     fn decode_unit(comp: Component, bx: uint, by: uint) !ImageError {
-        if bx >= comp.blocks_w || by >= comp.blocks_h : throw .invalid { message: "Block outside the component" }
+        if bx >= comp.blocks_w || by >= comp.blocks_h : throw .invalid("Block outside the component")
         if this.progressive : this.decode_block_progressive(comp, bx, by) !>
         else : this.decode_block(comp, bx, by) !>
     }
@@ -564,12 +564,12 @@ class Decoder {
             code = (code << 1) | this.read_bits(1).to(int)
             if code <= table.maxcode[l] {
                 let index = table.valptr[l] + (code - table.mincode[l]).to(uint)
-                if index >= table.count : throw .invalid { message: "Bad Huffman code" }
+                if index >= table.count : throw .invalid("Bad Huffman code")
                 return table.values[index]
             }
             l++
         }
-        throw .invalid { message: "Bad Huffman code" }
+        throw .invalid("Bad Huffman code")
     }
 
     // Reads a `size`-bit magnitude category value as a signed coefficient
@@ -588,9 +588,9 @@ class Decoder {
         if this.ss == 0 {
             if this.ah == 0 {
                 let dc_table = this.dc_tables[comp.td.to(uint)]
-                if !isset(dc_table) : throw .invalid { message: "Missing table" }
+                if !isset(dc_table) : throw .invalid("Missing table")
                 let category = this.decode_symbol(dc_table) !>
-                if category > 11 : throw .invalid { message: "Bad DC coefficient" }
+                if category > 11 : throw .invalid("Bad DC coefficient")
                 comp.pred += this.receive_extend(category.to(uint))
                 coefs[base] = (comp.pred << this.al).to(i16)
             } else if this.read_bits(1) == 1 {
@@ -599,7 +599,7 @@ class Decoder {
             return
         }
         let ac_table = this.ac_tables[comp.ta.to(uint)]
-        if !isset(ac_table) : throw .invalid { message: "Missing table" }
+        if !isset(ac_table) : throw .invalid("Missing table")
         if this.ah == 0 {
             // First pass over the band: runs of zeros, values, and end-of-band runs that
             // skip whole blocks
@@ -621,7 +621,7 @@ class Decoder {
                     continue
                 }
                 k += run
-                if k > 63 : throw .invalid { message: "Coefficients overflow the block" }
+                if k > 63 : throw .invalid("Coefficients overflow the block")
                 coefs[base + zigzag_order[k].to(uint)] = (this.receive_extend(size) << this.al).to(i16)
                 k++
             }
@@ -653,7 +653,7 @@ class Decoder {
                     skip = 64
                 }
             } else {
-                if size != 1 : throw .invalid { message: "Bad refinement code" }
+                if size != 1 : throw .invalid("Bad refinement code")
                 value = this.read_bits(1) == 1 ? bit : 0 - bit
             }
             while k <= this.se {
@@ -685,7 +685,7 @@ class Decoder {
         let natural_quant = [int]{ 0 x 64 }
         each this.components as comp {
             let quant = this.quant[comp.tq.to(uint)]
-            if !isset(quant) : throw .invalid { message: "Missing quantization table" }
+            if !isset(quant) : throw .invalid("Missing quantization table")
             let k: uint = 0
             while k < 64 {
                 natural_quant[zigzag_order[k].to(uint)] = quant[k].to(int)
@@ -714,12 +714,12 @@ class Decoder {
         let dc_table = this.dc_tables[comp.td.to(uint)]
         let ac_table = this.ac_tables[comp.ta.to(uint)]
         let quant = this.quant[comp.tq.to(uint)]
-        if !isset(dc_table) || !isset(ac_table) || !isset(quant) : throw .invalid { message: "Missing table" }
+        if !isset(dc_table) || !isset(ac_table) || !isset(quant) : throw .invalid("Missing table")
         let coef = this.coef
         let i: uint = 0
         while i < 64 : coef[i++] = 0
         let category = this.decode_symbol(dc_table) !>
-        if category > 11 : throw .invalid { message: "Bad DC coefficient" }
+        if category > 11 : throw .invalid("Bad DC coefficient")
         comp.pred += this.receive_extend(category.to(uint))
         coef[0] = comp.pred * quant[0].to(int)
         let k: uint = 1
@@ -733,7 +733,7 @@ class Decoder {
                 continue
             }
             k += run
-            if k > 63 : throw .invalid { message: "Coefficients overflow the block" }
+            if k > 63 : throw .invalid("Coefficients overflow the block")
             coef[zigzag_order[k].to(uint)] = this.receive_extend(size) * quant[k].to(int)
             k++
         }
