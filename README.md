@@ -7,7 +7,7 @@ crops, flips and rotates.
 ## Install
 
 ```sh
-vman install github.com/ctxcode/valk-image
+vman install github.com/zikue/valk-image
 ```
 
 ## Basic usage
